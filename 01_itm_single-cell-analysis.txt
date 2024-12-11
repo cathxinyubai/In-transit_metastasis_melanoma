@@ -1,0 +1,852 @@
+#Load packages
+library(Seurat)
+library(ggplot2)
+library(dittoSeq)
+library(RColorBrewer)
+library(SingleR)
+library(scater)
+library(AnnotationHub)
+library(biomaRt)
+library(CellChat)
+library(patchwork)
+library(viridis)
+library(AUCell)
+library(GSEABase)
+library(stringr)
+library(SCEVAN)
+library(dplyr)
+
+#Read data with singlet cells and no donor/jurkat (QC already done in previous paper); all_filter5 is ITM_melanoma
+all <- readRDS("/Users/camelia/Projects/ITM_singlecell/ITM_seurat_obj/ITM_melanoma.rds")
+
+#colour schemes (to be updated by Cath)
+# ? colour scheme for cells in the UMAP. This needs to be the same colour if possible for your spatial data
+# ? colour scheme for treatment response group
+
+#========================================== UMAP and cell freq analysis ==========================================#
+
+#Draw and save UMAP
+png ("itm_umap.png", width=25, height=35, res=300, units = 'cm')
+DimPlot(all_filter, reduction = "harmony.umap", group.by = "Major", split.by="treatment_status", label=TRUE, cols="Set3", raster=FALSE)
+dev.off()
+
+#Count frequency of major cell types for different samples
+#Example codes:
+#dittoBarPlot(object = all_melanocyte, var = "Major", group.by = "SAMPLE_ID", split.by="Major", scale = "count", legend.show=FALSE, main="Count frequency of melanocytes across ITM patients")
+#dittoBarPlot(object = all_tme, var = "Major_exp", group.by = "SAMPLE_ID", split.by="Major_exp", scale = "count", split.ncol = 3, legend.show=FALSE, main="Count frequency of TME cells across ITM patients")
+
+
+#========================================== cell-specific cytokine analysis ==========================================#
+#List all the cytokine/chemokine genes found in the literatures
+cytokines_genes <- c("CCL1", "CCL2", "CCL3", "CCL4", "CCL5", "CCL6", "CCL7", "CCL8", "CCL9", "CCL11", "CCL12", "CCL13", 
+"CCL14", "CCL15", "CCL16", "CCL17", "CCL18", "CCL19", "CCL20", "CCL21", "CCL22", "CCL23", "CCL24", "CCL25", "CCL26", 
+"CCL27", "CCL28", "CXCL1", "CXCL2", "CXCL3", "CXCL4", "CXCL5", "CXCL6", "CXCL7", "CXCL8", "CXCL9", "CXCL10", "CXCL11", 
+"CXCL12", "CXCL13", "CXCL14", "CXCL15", "CXCL16", "CXCL17", "TNF", "LTA", "LTB", "TNFSF4", "CD40LG", "TNFSF6", "TNFSF7", 
+"TNFSF8", "TNFSF9", "TNFSF10", "TNFSF11", "TNFSF13", "TNFSF13B", "EDA", "CX3CL1", "XCL1", "XCL2", "IL2", "IL15", "IL7", 
+"IL9", "IL21", "IL3", "CSF", "IL11", "IL30", "IL31", "LIF", "CNTF", "CTF1", "IL12", "IL23", "IL27", "IL35", "IL14", "IL16", 
+"IL32", "IL34", "IL22", "IL19", "IL20", "IL24", "IL26", "IFNL2", "IFNL3", "IFNL1", "IFNA1", "IFNA2", "IFNA4", "IFNA5", "IFNA6", 
+"IFNA7", "IFNA8", "IFNA10", "IFNA13", "IFNA14", "IFNA16", "IFNA17", "IFNA21", "IFNB1", "IFNK", "IFNW1", "IFNG", "IL1A", "IL1B", 
+"IL1RN", "IL36RN", "IL36A", "IL37", "IL36B", "IL36G", "IL1F10", "IL1F11", "IL1G", "IL17A", "KITLG", "SPP1", "MIF", "IL1", "TNFA", 
+"IL4", "IL5", "IL6", "IL10", "IL13")
+
+#Example codes to draw heatmap or dotplot
+#DoHeatmap(pbmc, features = top10$gene)+ scale_fill_gradientn(colours = rev(mapal))
+#DoHeatmap(object = all_tme, features=cytokines_genes, group.by="treatment_status") + scale_fill_viridis(option="D")
+#DotPlot(object = all_tme1, features=cytokines_genes, split.by="treatment_status") + coord_flip() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#========================================== SCEVAN clone analysis ==========================================#
+#prepare data
+all@meta.data$sample_group3 <- paste(all@meta.data$SAMPLE_ID, all@meta.data$Group_3_Resistance_vs_Non.resistance, sep="_")
+
+seurat_list <- SplitObject(all, split.by = "sample_group3")
+
+for (sample_name in names(seurat_list)) {
+  normcounts_matrix <- GetAssayData(seurat_list[[sample_name]], slot = "data")
+  normcounts_df <- as.data.frame(as.matrix(normcounts_matrix))
+  file_name <- paste0(sample_name, "_normcounts.txt")
+  write.table(normcounts_df, file = file_name, sep="\t", quote=F, col.names=NA, row.names=TRUE)
+}
+
+# Define the directory where the count matrix files are stored
+directory <- "/Users/camelia/Projects/ITM_singlecell/itm_normcounts"  # Replace with your actual directory path
+
+# Get the list of count matrix files (adjust the pattern as per your files)
+file_list <- list.files(path = directory, pattern = "*_normcounts.txt", full.names = TRUE)
+
+# Initialize an empty list to store count matrices
+count_matrix_list <- list()
+
+# Loop through each file and read the count matrix into the list
+for (file in file_list) {
+  # Read each count matrix (assuming tab-delimited files)
+  count_matrix <- read.table(file, header = TRUE, sep = "\t", row.names = 1)
+  
+  # Add the matrix to the list with a meaningful name (based on filename)
+  sample_name <- gsub("_normcounts.txt", "", basename(file))  # Adjust to match your filenames
+  count_matrix_list[[sample_name]] <- count_matrix
+}
+
+#run multiple sample analysis
+result <- multiSampleComparisonClonalCN(
+  count_matrix_list,
+  analysisName = "all",
+  organism = "human",
+  par_cores = 14,
+  plotTree = TRUE
+)
+
+#Example code for single sample analysis
+#PUB1097427_Non.resistance_PRE_count_mtx <- read.table("/Users/camelia/Projects/ITM_singlecell/itm_normcounts/PUB1097427_Non.resistance_PRE_normcounts.txt")
+#PUB1097427_Non.resistance_PRE_res <- pipelineCNA(PUB1097427_Non.resistance_PRE_count_mtx, sample = "PUB1097427_Non.resistance_PRE", par_cores = 14, SUBCLONES = TRUE, ClonalCN = TRUE, plotTree = TRUE, SCEVANsignatures = TRUE, organism = "human")
+
+################################################################################
+# UMAP
+itm_codex_obj[["umap"]] <- itm_codex_obj[["harmony.umap"]]
+
+# itm_codex_obj <- NormalizeData(itm_codex_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+# itm_codex_obj <- FindVariableFeatures(itm_codex_obj, selection.method = "vst", nfeatures = 2000)
+# library(future)
+# options(future.globals.maxSize = 50 * 1024^3)  # 50 GB
+# itm_codex_obj <- ScaleData(itm_codex_obj, features = VariableFeatures(itm_codex_obj))
+# 
+# itm_codex_obj <- RunPCA(itm_codex_obj, features = VariableFeatures(object = itm_codex_obj))
+# ElbowPlot(itm_codex_obj)
+# 
+# itm_codex_obj <- FindNeighbors(itm_codex_obj, dims = 1:10)
+# itm_codex_obj <- FindClusters(itm_codex_obj, resolution = 0.5)
+# 
+# itm_codex_obj <- RunUMAP(itm_codex_obj, dims = 1:10)
+# DimPlot(itm_codex_obj, reduction = "umap")
+
+png("plots/cath_new_obj/ITM_CODEXcelltypes.png", units = "in", width = 7, height = 4, res = 300)
+plot <- clusterCornerAxes(object = itm_codex_obj,
+                          reduction = 'umap',
+                          noSplit = TRUE,
+                          cornerTextSize = 3.5,
+                          clusterCol = "cath_grouped_Minor_exp",
+                          cellLabel = TRUE,
+                          cellLabelSize = 3.5,
+                          nbin = 200)
+
+plot <- plot + scale_color_manual(values = ggsci::pal_npg()(9))
+plot
+dev.off()
+
+################################################################################
+## codex marker QC
+codex_markers_genes <- c("SOX10",    # SOX10
+                         "PECAM1",   # CD31
+                         "CD34",     # CD34
+                         "THBD",     # CD141
+                         "ITGAX",    # CD11c
+                         "ITGAM",    # CD11b
+                         "CD68",     # CD68
+                         "CD14",     # CD14
+                         "CD163",    # CD163
+                         "MRC1",     # CD206
+                         "CD19",     # CD19
+                         "MS4A1",    # CD20
+                         "CD3E",     # CD3e
+                         "CD4",      # CD4
+                         "CD8A")     # CD8
+codex_markers_genes_df <- data.frame(gene = codex_markers_genes)
+
+# features plot
+png("plots/cath_new_obj/ITM_CODEXcelltypes_featuresplot.png", units = "in", width = 7, height = 7, res = 300)
+featurePlot(object = itm_codex_obj,
+            genes = codex_markers_genes,
+            nrow = 4,ncol = 4,
+            add.corArrow = T,
+            rm.legend = T,
+            keep.oneCor = T,
+            plot.size = 0.85)
+dev.off()
+
+# dot plot
+cell_order = c("Melanocyte", "Endothelial", "DC", "Macrophage", "B_cell", "CD4_T", "CD8_T")
+
+png("plots/cath_new_obj/ITM_CODEXcelltypes_dotplot_new.png", units = "in", width = 10, height = 4, res = 300)
+jjDotPlot(object = itm_codex_obj,
+          gene = codex_markers_genes_df$gene,
+          id = "celltype",
+          cluster.order = cell_order,
+          ytree = F
+          )
+dev.off()
+
+################################################################################
+## immune cell proportion analysis
+# Extract relevant metadata and filter out "Melanocyte"
+meta_data <- itm_codex_obj@meta.data %>%
+  filter(cath_grouped_Minor_exp != "Melanocyte")
+
+# Calculate TME cell proportions
+tme_cell_proportions <- meta_data %>%
+  group_by(SAMPLE_ID, cath_timepoint_response, cath_grouped_Minor_exp) %>%
+  summarise(count = n()) %>%
+  group_by(SAMPLE_ID, cath_timepoint_response) %>%
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+# Save as CSV
+write.csv(tme_cell_proportions, "codex-markers_singlecell_analysis/tme_cell_type_proportions.csv", row.names = FALSE)
+
+
+tme_cell_proportions$cath_timepoint_response <- factor(
+  tme_cell_proportions$cath_timepoint_response,
+  levels = c("PRE_Responsive", "PRE_Resistant", "PROG_Resistant")
+)
+
+# Plot violin plot
+ggplot(tme_cell_proportions, aes(
+  x = cath_grouped_Minor_exp, 
+  y = proportion, 
+  fill = cath_timepoint_response
+)) +
+  geom_violin(scale = "width", trim = FALSE, position = position_dodge(0.8)) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.8), size = 0.5, alpha = 0.7) +
+  stat_compare_means(
+    aes(group = cath_timepoint_response),
+    method = "kruskal.test",
+    label = "p.format",
+    hide.ns = TRUE,
+    label.y = 1.3
+  )
+
+## compare TME cell proportions between response groups - per cell type
+
+response_colors <- c(
+  "PRE_Responsive" = "deepskyblue4",
+  "PRE_Resistant" = "burlywood3",
+  "PROG_Resistant" = "coral4"
+)
+
+png("plots/cath_new_obj/ITM_CODEXcelltypes_response-compare.png", units = "in", width = 6, height = 6, res = 300)
+ggplot(tme_cell_proportions, aes(
+  x = cath_timepoint_response, 
+  y = proportion, 
+  fill = cath_timepoint_response
+)) +
+  geom_violin(trim = FALSE) +
+  geom_jitter(
+    size = 0.5, 
+    alpha = 0.7, 
+    position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.8)
+  ) +
+  stat_compare_means(
+    method = "wilcox.test", 
+    label = "p.format", 
+    hide.ns = TRUE,
+    comparisons = list(
+      c("PRE_Responsive", "PRE_Resistant"),
+      c("PRE_Responsive", "PROG_Resistant"),
+      c("PRE_Resistant", "PROG_Resistant")
+    ),
+    size = 2.5, # Adjust size of p-value labels
+    vjust = -3 # Move the p-value labels upwards
+  ) +
+  facet_wrap(~ cath_grouped_Minor_exp, scales = "free_y") + # Facet by cell type
+  labs(
+    title = "TME cell type proportions by response group",
+    x = "Response Group",
+    y = "Proportion",
+    fill = "Response Group"
+  ) +
+  scale_fill_manual(values = response_colors) + # Apply custom colors
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.4))) + # Add padding to y-axis (20% above max)
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+dev.off()
+
+################################################################################
+### Chemokine cytokine gene expression
+itm_codex_obj_tme <- subset(itm_codex_obj, subset = (cath_grouped_Minor_exp == "Melanocyte"), invert = TRUE)
+
+chemo_cyto_genes <- c("CCL2", "CCL3", "CCL4", "CCL5",
+                      "CXCL2", "CXCL3", "CXCL8","CXCL13", "CXCL16",
+                      "CXCR4", "XCR1",
+                      "IL1B", "IL16", "IL32",
+                      "IFNG", "TNF", "LTB", "TGFB1", "TNFSF9")
+chemo_cyto_genes_df <- data.frame(gene = chemo_cyto_genes)
+
+png("plots/cath_new_obj/ITM_CODEXcelltypes_chemo-cyto_dotplot.png", units = "in", width = 12, height = 5, res = 300)
+jjDotPlot(object = itm_codex_obj_tme,
+          gene = chemo_cyto_genes_df$gene,
+          id = 'celltype',
+          split.by = 'cath_timepoint_response',
+          split.by.aesGroup = T,
+          ytree = F)
+dev.off()
+
+################################################################################
+Idents(dc_obj) <- "cath_grouped_Minor_exp"
+DefaultAssay(dc_obj) <- "RNA"
+
+# maturation_genes <- c("CD40", "CD80", "CD86", "RELB", "CD83")
+# regulatory_genes <- c("CD274", "PDCD1LG2", "CD200", "FAS", "ALDH1A2", "SOCS1", "SOCS2")
+# migration_genes <- c("CCR7", "MYO1G", "CXCL16", "ADAM8", "ICAM1", "FSCN1", "MARCKS", "MARCKSL1")
+# trl_genes <- c("MYD88", "MAVS", "TLR9", "TLR8", "TLR7", "TLR6", "TLR5", "TLR4", "TLR3", "TLR2", "TLR1")
+
+dc_genes <- c("CD40", "CD80", "CD86", "RELB", "CD83",
+              "CCR7", "MYO1G", "CXCL16", "ADAM8", "ICAM1", "FSCN1", "MARCKS", "MARCKSL1",
+              "CD274", "PDCD1LG2", "CD200", "FAS", "ALDH1A2", "SOCS1", "SOCS2"
+              )
+dc_genes_df <- data.frame(gene = dc_genes)
+
+#group_order<- c("PROG_Resistant", "PRE_Resistant",  "PRE_Responsive")
+
+png("plots/cath_new_obj/ITM_CODEXcelltypes_DC-genes_dotplot.png", units = "in", width = 10, height = 4, res = 300)
+jjDotPlot(object = dc_obj,
+          gene = dc_genes_df$gene,
+          id = 'celltype',
+          split.by = 'cath_timepoint_response',
+          split.by.aesGroup = T,
+          #cluster.order = group_order,
+          dot.col = c("deepskyblue4", "beige", "coral1"),
+          ytree = F)
+dev.off()
+
+################################################################################
+### GSVA
+library(scGSVA)
+
+## TME
+PRE_itm_codex_obj_tme<- subset(itm_codex_obj_tme, subset = timepoint == "PRE")
+
+hsko<-buildAnnot(species="human",keytype="SYMBOL",anntype="KEGG")
+
+res<-scgsva(PRE_itm_codex_obj_tme, hsko, method="ssgsea")
+
+## Find significant pathways across groups
+pathways <- findPathway(res, group = "cath_timepoint_response")
+sig_pathways <- sigPathway(res, group = "cath_timepoint_response") # check sig pathways
+
+write.csv(pathways, file = "codex-markers_singlecell_analysis/ITM_TME_scGSVA_pathways.csv", row.names = TRUE)
+write.csv(sig_pathways, file = "codex-markers_singlecell_analysis/ITM_TME_scGSVA_pathways_significant.csv", row.names = TRUE)
+
+## visualise immune-related significant pathways
+
+# List of pathways to plot
+selected_pathways <- c(
+  "Complement.and.coagulation.cascades",
+  "T.cell.receptor.signaling.pathway",
+  "Cytokine.cytokine.receptor.interaction",
+  "Natural.killer.cell.mediated.cytotoxicity",
+  "B.cell.receptor.signaling.pathway",
+  "Toll.like.receptor.signaling.pathway",
+  "Antigen.processing.and.presentation",
+  "JAK.STAT.signaling.pathway",
+  "Leukocyte.transendothelial.migration",
+  "NOD.like.receptor.signaling.pathway"
+)
+
+output_folder <- "plots/cath_new_obj"
+
+# Loop through each pathway and generate plots
+for (pathway in selected_pathways) {
+  # Ridge plot 1: Group by cell type, split by response
+  plot1 <- ridgePlot(
+    res, 
+    features = pathway, 
+    group_by = "cath_grouped_Minor_exp", 
+    split.by = "cath_timepoint_response"
+  ) +
+    labs(title = paste("Pathway:", pathway, "- Group by Cell Type")) +
+    theme_minimal()
+  
+  # Save the first ridge plot
+  ggsave(
+    filename = file.path(output_folder, paste0("ridgeplot_", gsub("\\.", "_", pathway), "_group_by_cell_type.png")),
+    plot = plot1,
+    width = 6,
+    height = 4,
+    dpi = 300
+  )
+  
+  # Ridge plot 2: Group by response, split by cell type
+  plot2 <- ridgePlot(
+    res, 
+    features = pathway, 
+    group_by = "cath_timepoint_response", 
+    split.by = "cath_grouped_Minor_exp"
+  ) +
+    scale_fill_manual(values = response_colors) +  # Apply custom colors
+    labs(title = paste("Pathway:", pathway, "- Group by Response")) +
+    theme_minimal()
+  
+  # Save the second ridge plot
+  ggsave(
+    filename = file.path(output_folder, paste0("ridgeplot_", gsub("\\.", "_", pathway), "_group_by_response.png")),
+    plot = plot2,
+    width = 6,
+    height = 4,
+    dpi = 300
+  )
+}
+
+## Tumour
+PRE_itm_codex_obj<- subset(itm_codex_obj, subset = timepoint == "PRE")
+
+res_tumour <-scgsva(PRE_itm_codex_obj, hsko, method="ssgsea")
+
+pathways_tumour <- findPathway(res_tumour, group = "cath_timepoint_response")
+sig_pathways_tumour <- sigPathway(res_tumour, group = "cath_timepoint_response")
+
+write.csv(pathways_tumour, file = "codex-markers_singlecell_analysis/ITM_tumour_scGSVA_pathways.csv", row.names = TRUE)
+write.csv(sig_pathways_tumour, file = "codex-markers_singlecell_analysis/ITM_tumour_scGSVA_pathways_significant.csv", row.names = TRUE)
+
+
+ridgePlot(res_tumour,features="JAK.STAT.signaling.pathway",group_by="cath_grouped_Minor_exp", split.by = "cath_timepoint_response")
+
+
+ridgePlot(res_tumour,features="JAK.STAT.signaling.pathway",group_by="cath_timepoint_response", split.by = "cath_grouped_Minor_exp")+
+  scale_fill_manual(values = response_colors)
+
+
+#========================================== cellchat analysis ==========================================#
+```{r}
+library(CellChat)
+library(ggalluvial)
+library(ggplot2)
+library(patchwork)
+library(ggalluvial)
+library(ComplexHeatmap)
+library(igraph)
+library(Seurat)
+library(svglite)
+```
+
+```{r}
+# Increase the memory limit for future package globals
+options(future.globals.maxSize = 20 * 1024^3)  # 2 GB
+```
+
+## cellchat analysis for codex marker TME cell types
+```{r}
+# Load the dataset
+itm_codex_obj <- readRDS("ITM_n24_AllCells_PDEMUX_cleaned_filtered_CODEX_markers_cDC1only_18Nov24.rds")
+
+# Set Idents
+Idents(itm_codex_obj) <- itm_codex_obj@meta.data$cath_grouped_Minor_exp
+```
+
+```{r}
+# Subset pre_response and pre_resistant groups
+pre_response <- subset(itm_codex_obj, cath_timepoint_response == "PRE_Responsive")
+pre_resistant <- subset(itm_codex_obj, cath_timepoint_response == "PRE_Resistant")
+prog_resistant <- subset(itm_codex_obj, cath_timepoint_response == "PROG_Resistant")
+```
+
+```{r}
+# Create CellChat object for pre_response
+cellchat_pre_response <- createCellChat(object = pre_response, group.by = "cath_grouped_Minor_exp", assay = "RNA")
+
+# Load the human CellChat database
+CellChatDB <- CellChatDB.human
+
+# Use all CellChatDB except for "Non-protein Signaling"
+CellChatDB.use <- subsetDB(CellChatDB)
+
+cellchat_pre_response@DB <- CellChatDB.use
+
+# Subset the data based on the selected category
+cellchat_pre_response <- subsetData(cellchat_pre_response)
+
+# Parallel processing
+future::plan("multisession", workers = 4)
+
+# Identify over-expressed genes and interactions
+cellchat_pre_response <- identifyOverExpressedGenes(cellchat_pre_response)
+cellchat_pre_response <- identifyOverExpressedInteractions(cellchat_pre_response)
+
+# Compute communication probability
+cellchat_pre_response <- computeCommunProb(cellchat_pre_response, raw.use = TRUE, population.size = TRUE, type = "triMean")
+
+# Filter communications based on the number of cells
+cellchat_pre_response <- filterCommunication(cellchat_pre_response, min.cells = 10)
+
+# Subset communication dataframe
+df.net_pre_response <- subsetCommunication(cellchat_pre_response)
+
+# Compute communication probability for pathways and aggregate networks
+cellchat_pre_response <- computeCommunProbPathway(cellchat_pre_response)
+cellchat_pre_response <- aggregateNet(cellchat_pre_response)
+
+# Compute centrality measures
+cellchat_pre_response <- netAnalysis_computeCentrality(cellchat_pre_response, slot.name = "netP")
+
+# Save the full CellChat object for pre_response
+saveRDS(cellchat_pre_response, file = "cellchat_pre_response_grouped_minor_exp_CODEXmarkers.rds")
+```
+
+```{r}
+# Create CellChat object for pre_resistant
+cellchat_pre_resistant <- createCellChat(object = pre_resistant, group.by = "cath_grouped_Minor_exp", assay = "RNA")
+
+# Use all CellChatDB except for "Non-protein Signaling"
+cellchat_pre_resistant@DB <- CellChatDB.use
+
+# Subset the data based on the selected category
+cellchat_pre_resistant <- subsetData(cellchat_pre_resistant)
+
+# Parallel processing
+future::plan("multisession", workers = 4)
+
+# Identify over-expressed genes and interactions
+cellchat_pre_resistant <- identifyOverExpressedGenes(cellchat_pre_resistant)
+cellchat_pre_resistant <- identifyOverExpressedInteractions(cellchat_pre_resistant)
+
+# Compute communication probability
+cellchat_pre_resistant <- computeCommunProb(cellchat_pre_resistant, raw.use = TRUE, population.size = TRUE, type = "triMean")
+
+# Filter communications based on the number of cells
+cellchat_pre_resistant <- filterCommunication(cellchat_pre_resistant, min.cells = 10)
+
+# Subset communication dataframe
+df.net_pre_resistant <- subsetCommunication(cellchat_pre_resistant)
+
+# Compute communication probability for pathways and aggregate networks
+cellchat_pre_resistant <- computeCommunProbPathway(cellchat_pre_resistant)
+cellchat_pre_resistant <- aggregateNet(cellchat_pre_resistant)
+
+# Compute centrality measures
+cellchat_pre_resistant <- netAnalysis_computeCentrality(cellchat_pre_resistant, slot.name = "netP")
+
+# Save the full CellChat object for pre_resistant
+saveRDS(cellchat_pre_resistant, file = "cellchat_pre_resistant_grouped_minor_exp_CODEXmarkers.rds")
+```
+
+```{r}
+# Create CellChat object for prog_resistant
+cellchat_prog_resistant <- createCellChat(object = prog_resistant, group.by = "cath_grouped_Minor_exp", assay = "RNA")
+
+# Use all CellChatDB except for "Non-protein Signaling"
+cellchat_prog_resistant@DB <- CellChatDB.use
+
+# Subset the data based on the selected category
+cellchat_prog_resistant <- subsetData(cellchat_prog_resistant)
+
+# Parallel processing
+future::plan("multisession", workers = 4)
+
+# Identify over-expressed genes and interactions
+cellchat_prog_resistant <- identifyOverExpressedGenes(cellchat_prog_resistant)
+cellchat_prog_resistant <- identifyOverExpressedInteractions(cellchat_prog_resistant)
+
+# Compute communication probability
+cellchat_prog_resistant <- computeCommunProb(cellchat_prog_resistant, raw.use = TRUE, population.size = TRUE, type = "triMean")
+
+# Filter communications based on the number of cells
+cellchat_prog_resistant <- filterCommunication(cellchat_prog_resistant, min.cells = 10)
+
+# Subset communication dataframe
+df.net_pre_resistant <- subsetCommunication(cellchat_prog_resistant)
+
+# Compute communication probability for pathways and aggregate networks
+cellchat_prog_resistant <- computeCommunProbPathway(cellchat_prog_resistant)
+cellchat_prog_resistant <- aggregateNet(cellchat_prog_resistant)
+
+# Compute centrality measures
+cellchat_prog_resistant <- netAnalysis_computeCentrality(cellchat_prog_resistant, slot.name = "netP")
+
+# Save the full CellChat object for pre_resistant
+saveRDS(cellchat_prog_resistant, file = "cellchat_prog_resistant_grouped_minor_exp_CODEXmarkers.rds")
+```
+
+
+### PRE response vs resistant
+```{r}
+# Clear the workspace
+rm(list = ls())
+
+# Load the saved CellChat objects
+cellchat_pre_response <- readRDS("cellchat_pre_response_grouped_minor_exp_CODEXmarkers.rds")
+cellchat_pre_resistant <- readRDS("cellchat_pre_resistant_grouped_minor_exp_CODEXmarkers.rds")
+```
+
+```{r}
+# Combine the pre_response and pre_resistant CellChat objects
+object.list <- list(Pre_Response = cellchat_pre_response, Pre_Resistant = cellchat_pre_resistant)
+
+# Merge the CellChat objects, adding prefixes to avoid naming conflicts
+cellchat_minor_exp <- mergeCellChat(object.list, add.names = names(object.list), cell.prefix = TRUE)
+```
+
+```{r}
+# save the merged CellChat object and the list of the two separate objects for later use
+save(object.list, file = "ITM_PRE_cellchat_object.list_response_vs_resistant_CODEX-WGS-filtered.RData")
+
+saveRDS(cellchat_minor_exp, file = "itm_PRE_cellchat_CODEX-WGS-filtered.rds")
+```
+
+```{r}
+# Compare the number of interactions between the two groups
+gg1 <- compareInteractions(cellchat_minor_exp, show.legend = FALSE, group = c("Pre_Response", "Pre_Resistant"))
+
+# Compare the strength of interactions (weights) between the two groups
+gg2 <- compareInteractions(cellchat_minor_exp, show.legend = FALSE, group = c("Pre_Response", "Pre_Resistant"), measure = "weight")
+
+# Plot the comparison results
+gg1 + gg2
+```
+
+```{r}
+png("plots/cath_new_obj/pre_diff_number_interaction_network.png", units = "cm", width = 30, height = 15, res = 300)
+
+# Set up side-by-side plots
+#par(mfrow = c(1, 2), xpd = TRUE)
+
+# Differential interaction network visualization (number of interactions)
+netVisual_diffInteraction(cellchat_minor_exp, weight.scale = TRUE, comparison = c("Pre_Response", "Pre_Resistant"))
+
+# Differential interaction network visualization (interaction strength)
+#netVisual_diffInteraction(cellchat_minor_exp, weight.scale = TRUE, measure = "weight", comparison = c("Pre_Response", "Pre_Resistant"))
+
+dev.off()
+```
+
+```{r}
+# Define the function to plot interactions for each cell type within a CellChat group
+plot_interactions <- function(cellchat_obj, group_name) {
+  # Extract the interaction weight matrix for the specified group
+  mat <- cellchat_obj@net[[group_name]]$weight  
+  
+  # Set idents if not already set
+  if (is.null(cellchat_obj@idents)) {
+    cellchat_obj@idents <- factor(cellchat_obj@meta$cath_grouped_Minor_exp)
+  }
+  
+  # Get the number of cells in each cell group
+  groupSize <- as.numeric(table(cellchat_obj@idents))
+  
+  # Loop through each cell type and visualize its interactions separately
+  for (i in 1:nrow(mat)) {
+    # Create a zero matrix with the same dimensions as the original weight matrix
+    mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+    
+    # Copy the interactions of the i-th cell type to the new matrix
+    mat2[i, ] <- mat[i, ]
+    
+    # Open a PNG device to save the plot
+    png(filename = paste0("plots/cath_new_obj/", group_name, "_circleplot_", rownames(mat)[i], ".png"), 
+        units = "cm", width = 15, height = 15, res = 300)
+    
+    # Plot the interaction network for the i-th cell type
+    netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = TRUE, 
+                     edge.weight.max = max(mat), title.name = rownames(mat)[i])
+    
+    # Close the PNG device to save the file
+    dev.off()
+  }
+}
+
+# Set idents to Minor_exp if not set already (update as needed for your object)
+cellchat_minor_exp@idents <- factor(cellchat_minor_exp@meta$cath_grouped_Minor_exp)
+
+# Call the function for each group (Pre_Response and Pre_Resistant)
+plot_interactions(cellchat_minor_exp, "Pre_Response")
+plot_interactions(cellchat_minor_exp, "Pre_Resistant")
+```
+
+```{r}
+# Heatmap comparison of interaction numbers
+gg1 <- netVisual_heatmap(cellchat_minor_exp, comparison = c("Pre_Response", "Pre_Resistant"))
+
+# Heatmap comparison of interaction strengths (weights)
+gg2 <- netVisual_heatmap(cellchat_minor_exp, measure = "weight", comparison = c("Pre_Response", "Pre_Resistant"))
+
+png("plots/cath_new_obj/itm_TME_heatmap_interaction_minor_cell_types.png", width = 20, height = 12, units = "cm", res = 300)
+gg1+gg2
+dev.off()
+```
+
+```{r}
+# Rank networks in comparison mode
+gg1 <- rankNet(cellchat_minor_exp, mode = "comparison", measure = "weight", sources.use = NULL, targets.use = NULL, stacked = TRUE, do.stat = TRUE)
+
+# Rank networks in non-stacked comparison mode
+gg2 <- rankNet(cellchat_minor_exp, mode = "comparison", measure = "weight", sources.use = NULL, targets.use = NULL, stacked = FALSE, do.stat = TRUE)
+
+# Combine and display the two plots
+png("plots/cath_new_obj/itm_TME_bar_minor_cell_types.png", width = 25, height = 25, units = "cm", res = 300)
+gg1 + gg2
+dev.off()
+```
+
+```{r}
+library(ComplexHeatmap)
+
+# Index i = 1 for pre_response and i+1 for pre_resistant
+i <- 1
+
+# Union of pathways from both pre_response and pre_resistant
+pathway.union <- union(object.list[[i]]@netP$pathways, object.list[[i+1]]@netP$pathways)
+
+# Signaling role heatmap for pre_response
+ht1 <- netAnalysis_signalingRole_heatmap(object.list[[i]], 
+                                         pattern = "outgoing", 
+                                         signaling = pathway.union, 
+                                         title = names(object.list)[i], 
+                                         width = 7, height = 25)
+
+# Signaling role heatmap for pre_resistant
+ht2 <- netAnalysis_signalingRole_heatmap(object.list[[i+1]], 
+                                         pattern = "outgoing", 
+                                         signaling = pathway.union, 
+                                         title = names(object.list)[i+1], 
+                                         width = 7, height = 25)
+
+png("plots/cath_new_obj/itm_heatmap_comparison.png", width = 25, height = 30, units = "cm", res = 300)
+draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+dev.off()
+```
+
+```{r}
+library(ComplexHeatmap)
+
+# Index i = 1 for pre_response and i+1 for pre_resistant
+i <- 1
+
+# Union of pathways from both pre_response and pre_resistant
+pathway.union <- union(object.list[[i]]@netP$pathways, object.list[[i+1]]@netP$pathways)
+
+# Signaling role heatmap for pre_response
+ht1 <- netAnalysis_signalingRole_heatmap(object.list[[i]], 
+                                         pattern = "incoming", 
+                                         signaling = pathway.union, 
+                                         title = names(object.list)[i], 
+                                         width = 7, height = 25)
+
+# Signaling role heatmap for pre_resistant
+ht2 <- netAnalysis_signalingRole_heatmap(object.list[[i+1]], 
+                                         pattern = "incoming", 
+                                         signaling = pathway.union, 
+                                         title = names(object.list)[i+1], 
+                                         width = 7, height = 25)
+
+png("plots/cath_new_obj/itm_heatmap_comparison_incoming.png", width = 25, height = 30, units = "cm", res = 300)
+draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+dev.off()
+```
+
+```{r}
+# Create the list of scatter plots
+num.link <- sapply(object.list, function(x) {rowSums(x@net$count) + colSums(x@net$count)-diag(x@net$count)})
+weight.MinMax <- c(min(num.link), max(num.link)) # Control the dot size in different datasets
+gg <- list()
+for (i in 1:length(object.list)) {
+  gg[[i]] <- netAnalysis_signalingRole_scatter(object.list[[i]], title = names(object.list)[i], weight.MinMax = weight.MinMax)
+}
+
+# Combine the plots using patchwork
+combined_plot <- patchwork::wrap_plots(plots = gg)
+
+# Save the combined plot using ggsave
+ggsave(filename = "plots/cath_new_obj/signaling_role_scatter.png", plot = combined_plot, width = 10, height = 4, dpi = 300)
+```
+
+```{r}
+# Generate signaling scatter plots for the filtered objects with truncated/rescaled axes
+library(ggplot2)
+
+gg <- list()
+for (i in seq_along(object.list)) {
+  # Create the base scatter plot
+  plot <- netAnalysis_signalingRole_scatter(
+    object.list[[i]], 
+    title = names(object.list)[i], 
+    weight.MinMax = weight.MinMax
+  )
+  
+  # Truncate or rescale the axes
+  plot <- plot +
+    coord_cartesian(xlim = c(0, 6e-7), ylim = c(0, 1e-5)) + # Adjust limits as needed
+    theme_minimal() # Optional: Apply a clean theme
+  
+  gg[[i]] <- plot
+}
+
+# Combine the plots using patchwork
+combined_plot <- patchwork::wrap_plots(plots = gg)
+
+# Save the combined plot
+ggsave(
+  filename = "plots/cath_new_obj/signaling_role_scatter_rescaled.png", 
+  plot = combined_plot, 
+  width = 8, 
+  height = 4, 
+  dpi = 300
+)
+```
+
+```{r}
+# Retrieve cell types
+#cell_types <- levels(cellchat_minor_exp@idents)
+cell_types <- c("Endothelial", "Macrophage", "Melanocyte")
+
+# Define the target cell types (all cell types)
+targets <- c(1:7) # Numeric indices for all cell types
+comparison <- c(1, 2) # Comparison groups
+
+# Output directory
+output_dir <- "plots/cath_new_obj/"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Loop through each cell type as the source
+for (i in seq_along(cell_types)) {
+  source_cell <- cell_types[i]
+  
+  # Generate plots for increased and decreased signaling
+  gg1 <- netVisual_bubble(
+    cellchat_minor_exp, 
+    sources.use = source_cell, 
+    targets.use = targets, 
+    comparison = comparison, 
+    max.dataset = 2, 
+    title.name = paste("Increased signaling in", source_cell), 
+    angle.x = 45, 
+    remove.isolate = TRUE
+  )
+  
+  gg2 <- netVisual_bubble(
+    cellchat_minor_exp, 
+    sources.use = source_cell, 
+    targets.use = targets, 
+    comparison = comparison, 
+    max.dataset = 1, 
+    title.name = paste("Decreased signaling in", source_cell), 
+    angle.x = 45, 
+    remove.isolate = TRUE
+  )
+  
+  # Save the combined plot
+  output_file <- paste0(output_dir, source_cell, "_bubbleplot_comparison.png")
+  png(output_file, width = 26, height = 26, units = "cm", res = 300)
+  print(gg1 + gg2)
+  dev.off()
+}
+```
+
+```{r}
+gg2 <- netVisual_bubble(
+    cellchat_minor_exp, 
+    sources.use = 4, 
+    targets.use = targets, 
+    comparison = comparison, 
+    max.dataset = 1, 
+    title.name = "Decreased signaling in DC", 
+    angle.x = 45, 
+    remove.isolate = TRUE
+  )
+
+png("plots/cath_new_obj/DC_bubbleplot_comparison.png", width = 12, height = 20, units = "cm", res = 300)
+print(gg2)
+dev.off()
+```
+
+
