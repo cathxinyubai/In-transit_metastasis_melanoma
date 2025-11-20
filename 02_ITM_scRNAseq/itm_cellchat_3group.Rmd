@@ -1,0 +1,259 @@
+---
+title: "itm_cellchat_3groups-merged"
+author: "Xinyu Bai"
+date: "2025-05-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(CellChat)
+library(ggalluvial)
+library(ggplot2)
+library(patchwork)
+library(ggalluvial)
+library(ComplexHeatmap)
+library(igraph)
+library(Seurat)
+library(svglite)
+```
+
+```{r}
+# Load CellChat objects
+cellchat_pre_response <- readRDS("cellchat/cellchat_pre_response_grouped_minor_exp_CODEXmarkers.rds")
+cellchat_pre_resistant <- readRDS("cellchat/cellchat_pre_resistant_grouped_minor_exp_CODEXmarkers.rds")
+cellchat_prog_resistant <- readRDS("cellchat/cellchat_prog_resistant_grouped_minor_exp_CODEXmarkers.rds")
+
+# Merge
+object.list <- list(
+  Pre_Response = cellchat_pre_response,
+  Pre_Resistant = cellchat_pre_resistant,
+  Prog_Resistant = cellchat_prog_resistant
+)
+
+cellchat_all <- mergeCellChat(object.list, add.names = names(object.list), cell.prefix = TRUE)
+
+# Save
+save(object.list, file = "ITM_3group_cellchat_object.list.RData")
+saveRDS(cellchat_all, file = "itm_3group_cellchat.rds")
+```
+
+```{r}
+# Clear the workspace
+rm(list = ls())
+
+cellchat_all <- readRDS("itm_3group_cellchat.rds")
+load("ITM_3group_cellchat_object.list.RData")
+```
+
+```{r}
+gg1 <- compareInteractions(cellchat_all, show.legend = FALSE, group = c("Pre_Response", "Pre_Resistant", "Prog_Resistant"))
+
+gg2 <- compareInteractions(cellchat_all, show.legend = FALSE, group = c("Pre_Response", "Pre_Resistant", "Prog_Resistant"), measure = "weight")
+
+gg1 + gg2
+```
+
+```{r}
+# Function to compare interactions and export pathway tables
+compare_cellchat_pairs <- function(cellchat_obj, g1, g2, plot_dir, table_dir) {
+  comparison_label <- paste0(g1, "_vs_", g2)
+  message("Processing: ", comparison_label)
+
+  # Plot differential interaction network
+  png_filename <- paste0(plot_dir, "netVisual_diffInteraction_", comparison_label, ".png")
+  png(png_filename, width = 32, height = 16, units = "cm", res = 300)
+  netVisual_diffInteraction(cellchat_obj, weight.scale = TRUE, comparison = c(g1, g2))
+  dev.off()
+
+  # Extract probability arrays
+  netP_g1 <- cellchat_obj@netP[[g1]]$prob
+  netP_g2 <- cellchat_obj@netP[[g2]]$prob
+
+  # Skip if missing
+  if (is.null(netP_g1) || is.null(netP_g2)) {
+    warning("Missing pathway data for comparison: ", comparison_label)
+    return(NULL)
+  }
+
+  # Compute average signaling probability per pathway (collapsed)
+  avg_pathway_g1 <- sapply(1:dim(netP_g1)[3], function(i) {
+    mean(netP_g1[, , i], na.rm = TRUE)
+  })
+  avg_pathway_g2 <- sapply(1:dim(netP_g2)[3], function(i) {
+    mean(netP_g2[, , i], na.rm = TRUE)
+  })
+
+  names(avg_pathway_g1) <- dimnames(netP_g1)[[3]]
+  names(avg_pathway_g2) <- dimnames(netP_g2)[[3]]
+
+  # Align to common pathways
+  common_pathways <- intersect(names(avg_pathway_g1), names(avg_pathway_g2))
+  if (length(common_pathways) == 0) {
+    warning("No common pathways found for: ", comparison_label)
+    return(NULL)
+  }
+
+  avg_pathway_g1 <- avg_pathway_g1[common_pathways]
+  avg_pathway_g2 <- avg_pathway_g2[common_pathways]
+  pathway_fc <- avg_pathway_g2 - avg_pathway_g1
+
+  # Create dataframe
+  pathway_df <- data.frame(
+    Pathway = common_pathways,
+    Mean_Activity_g1 = avg_pathway_g1,
+    Mean_Activity_g2 = avg_pathway_g2,
+    Delta = pathway_fc
+  )
+
+  pathway_df <- pathway_df[order(-abs(pathway_df$Delta)), ]
+
+  # Save CSV
+  csv_filename <- paste0(table_dir, "pathway_delta_", comparison_label, ".csv")
+  write.csv(pathway_df, file = csv_filename, row.names = FALSE)
+}
+```
+
+```{r}
+# Main script
+group_names <- c("Pre_Response", "Pre_Resistant", "Prog_Resistant")
+plot_dir <- "plots/cath_obj_v3/cellchat_diff_interaction_networks/"
+table_dir <- "results/cath_obj_v3/cellchat_diff_pathways_tables/"
+
+dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(table_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Run all pairwise comparisons
+pairwise_comparisons <- combn(group_names, 2, simplify = FALSE)
+for (pair in pairwise_comparisons) {
+  compare_cellchat_pairs(cellchat_all, pair[1], pair[2], plot_dir, table_dir)
+}
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(readr)
+
+# Set your directory path to the saved CSVs
+table_dir <- "results/cath_obj_v3/cellchat_diff_pathways_tables/"
+
+# List of comparison files
+files <- list.files(table_dir, pattern = "pathway_delta_.*\\.csv", full.names = TRUE)
+
+# Loop through each file and create a bar plot
+for (file in files) {
+  # Extract comparison label from filename
+  comparison_label <- gsub("pathway_delta_|\\.csv", "", basename(file))
+
+  # Load the CSV
+  df <- read_csv(file)
+
+  # Select top N pathways by absolute delta
+  top_n <- 10
+  df_top <- df %>%
+    arrange(desc(abs(Delta))) %>%
+    head(top_n)
+
+  # Plot
+  p <- ggplot(df_top, aes(x = reorder(Pathway, Delta), y = Delta, fill = Delta > 0)) +
+    geom_bar(stat = "identity", width = 0.7, show.legend = FALSE) +
+    coord_flip() +
+    labs(title = paste("Top Pathway Delta:", comparison_label),
+         x = "Pathway", y = "Δ Mean Signaling Activity (g2 - g1)") +
+    theme_minimal() +
+    scale_fill_manual(values = c("TRUE" = "#2ca02c", "FALSE" = "#d62728"))
+
+  # Save plot
+  ggsave(paste0("plots/cath_obj_v3/delta_barplot_", comparison_label, ".png"),
+         plot = p, width = 10, height = 6, dpi = 300)
+}
+```
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+
+# Define directory containing CSVs
+csv_dir <- "results/cath_obj_v3/cellchat_diff_pathways_tables/"  # update if needed
+
+# List all delta CSV files
+delta_files <- list.files(csv_dir, pattern = "^pathway_delta_.*\\.csv$", full.names = TRUE)
+
+# Read and combine all CSVs into a single dataframe
+delta_list <- lapply(delta_files, function(file) {
+  df <- read.csv(file)
+  comparison <- gsub("pathway_delta_|\\.csv", "", basename(file))
+  df$Comparison <- comparison
+  return(df[, c("Pathway", "Delta", "Comparison")])
+})
+
+# Combine into one dataframe
+delta_all <- bind_rows(delta_list)
+
+# Pivot to wide format for heatmap
+delta_mat <- delta_all %>%
+  pivot_wider(names_from = Comparison, values_from = Delta, values_fill = 0) %>%
+  column_to_rownames("Pathway") %>%
+  as.matrix()
+
+# Optionally filter top pathways by max delta
+top_n <- 20
+top_pathways <- names(sort(apply(abs(delta_mat), 1, max), decreasing = TRUE))[1:top_n]
+delta_mat_subset <- delta_mat[top_pathways, ]
+
+# Plot heatmap
+Heatmap(delta_mat_subset,
+        name = "Δ Signaling",
+        col = colorRamp2(c(min(delta_mat_subset), 0, max(delta_mat_subset)),
+                         c("blue", "white", "red")),
+        cluster_rows = TRUE,
+        cluster_columns = FALSE,
+        show_row_names = TRUE,
+        row_names_gp = gpar(fontsize = 10),
+        column_names_gp = gpar(fontsize = 10),
+        heatmap_legend_param = list(title = "Δ Activity"))
+
+```
+
+
+
+```{r}
+activity_clean <- read.csv("results/cath_obj_v3/cellchat_diff_pathways_tables/mean_pathway_activity_all_groups.csv", row.names = 1)
+
+# Select top 30 pathways by average activity
+top_n <- 30
+top_pathways <- rowMeans(activity_clean, na.rm = TRUE) %>%
+  sort(decreasing = TRUE) %>%
+  head(top_n) %>%
+  names()
+
+activity_subset <- activity_clean[top_pathways, ]
+
+# Plot heatmap
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+
+# Use colorRamp2 with two breaks and two colors
+color_fun <- colorRamp2(
+  range(activity_subset, na.rm = TRUE),
+  c("white", "red")
+)
+
+# Plot heatmap
+Heatmap(as.matrix(activity_subset),
+        name = "Mean Activity",
+        col = color_fun,
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        row_names_gp = gpar(fontsize = 10),
+        column_names_gp = gpar(fontsize = 10),
+        heatmap_legend_param = list(title = "Mean Activity"))
+```
+

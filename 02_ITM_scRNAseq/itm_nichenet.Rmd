@@ -1,0 +1,389 @@
+---
+title: "itm_CODEXgroups_nichenet"
+author: "xb"
+date: "2025-03-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(nichenetr)
+library(Seurat)
+library(SeuratObject)
+library(tidyverse)
+```
+
+```{r}
+seuratObj <- readRDS("seurat_objects/ITM_n24_AllCells_PDEMUX_cleaned_filtered_CODEX_markers_9May25.rds")
+Idents(seuratObj) <- seuratObj@meta.data$cath_grouped_Minor_exp
+seuratObj@meta.data %>% head()
+```
+
+```{r}
+# Additionally, if your expression data has the older gene symbols, you may want to use our alias #conversion function to avoid the loss of gene names.
+#seuratObj <- alias_to_symbol_seurat(seuratObj, "human")
+```
+
+```{r}
+seuratObj@meta.data$cath_grouped_Minor_exp %>% table() 
+     # B_cell       CD4_T       CD8_T          DC Endothelial  Macrophage  Melanocyte 
+     #    357        1061        2221         101         270        1958       71994 
+```
+
+```{r}
+lr_network <- readRDS("nichenet_data/lr_network_human_21122021.rds")
+ligand_target_matrix <- readRDS("nichenet_data/ligand_target_matrix_nsga2r_final.rds")
+weighted_networks <- readRDS("nichenet_data/weighted_networks_nsga2r_final.rds")
+```
+
+```{r}
+head(lr_network)
+ligand_target_matrix[1:5,1:5] # target genes in rows, ligands in columns
+head(weighted_networks$lr_sig) # interactions and their weights in the ligand-receptor + signaling network
+head(weighted_networks$gr) # interactions and their weights in the gene regulatory network
+```
+
+```{r}
+run_nichenet_analysis <- function(receiver_celltype, sender_celltypes, condition_oi, condition_reference, seuratObj, output_file, 
+                                  save_tables = TRUE, summary_file = "nichenet_ligand_summary.csv") {
+  suppressMessages({
+    library(nichenetr)
+    library(Seurat)
+    library(SeuratObject)
+    library(tidyverse)
+    library(cowplot)
+    library(ggpubr)
+    library(glue)
+    library(grid)      # for unit()
+    library(scales)    # for pretty_breaks()
+  })
+
+  message(glue("Running NicheNet: Receiver = {receiver_celltype}, {condition_oi} vs {condition_reference}"))
+
+  # Load NicheNet reference files
+  lr_network <- readRDS("nichenet_data/lr_network_human_21122021.rds")
+  ligand_target_matrix <- readRDS("nichenet_data/ligand_target_matrix_nsga2r_final.rds")
+  weighted_networks <- readRDS("nichenet_data/weighted_networks_nsga2r_final.rds")
+
+  Idents(seuratObj) <- seuratObj@meta.data$cath_grouped_Minor_exp
+  expressed_genes_receiver <- get_expressed_genes(receiver_celltype, seuratObj, pct = 0.05)
+
+  all_receptors <- unique(lr_network$to)  
+  expressed_receptors <- intersect(all_receptors, expressed_genes_receiver)
+  potential_ligands <- lr_network %>% filter(to %in% expressed_receptors) %>% pull(from) %>% unique()
+
+  list_expressed_genes_sender <- sender_celltypes %>% unique() %>% lapply(get_expressed_genes, seuratObj, 0.1)
+  expressed_genes_sender <- list_expressed_genes_sender %>% unlist() %>% unique()
+  potential_ligands_focused <- intersect(potential_ligands, expressed_genes_sender) 
+
+  seurat_obj_receiver <- subset(seuratObj, idents = receiver_celltype)
+
+  DE_table_receiver <- FindMarkers(
+    object = seurat_obj_receiver,
+    ident.1 = condition_oi, ident.2 = condition_reference,
+    group.by = "cath_timepoint_response",
+    min.pct = 0.01) %>% rownames_to_column("gene")
+
+  geneset_oi <- DE_table_receiver %>%
+    filter(gene %in% rownames(ligand_target_matrix)) %>%
+    filter(p_val <= 0.05) %>%  ### remove if not enough DEG
+    slice_max(order_by = abs(avg_log2FC), n = 100) %>%
+    pull(gene) %>%
+    .[. %in% rownames(ligand_target_matrix)]
+
+  background_expressed_genes <- expressed_genes_receiver %>% .[. %in% rownames(ligand_target_matrix)]
+
+  message(glue("  - DE genes in ligand matrix: {length(geneset_oi)}"))
+  message(glue("  - Focused potential ligands: {length(potential_ligands_focused)}"))
+
+  if (length(geneset_oi) < 10) {
+    message(glue("  ⚠ Skipped: Too few DE genes for {receiver_celltype} {condition_oi} vs {condition_reference}"))
+    return(NULL)
+  }
+
+  if (length(potential_ligands_focused) < 5) {
+    message(glue("  ⚠ Skipped: Too few potential ligands for {receiver_celltype} {condition_oi} vs {condition_reference}"))
+    return(NULL)
+  }
+
+  # Try prediction
+  ligand_activities <- tryCatch({
+    predict_ligand_activities(
+      geneset = geneset_oi,
+      background_expressed_genes = background_expressed_genes,
+      ligand_target_matrix = ligand_target_matrix,
+      potential_ligands = potential_ligands
+    )
+  }, error = function(e) {
+    message(glue("  ❌ Failed ligand activity prediction: {e$message}"))
+    return(NULL)
+  })
+
+  if (is.null(ligand_activities)) return(NULL)
+
+  ligand_activities <- ligand_activities %>%
+    arrange(-aupr_corrected) %>%
+    mutate(rank = rank(desc(aupr_corrected)))
+
+  best_upstream_ligands <- ligand_activities %>%
+    filter(test_ligand %in% potential_ligands_focused) %>%
+    top_n(30, aupr_corrected) %>% arrange(-aupr_corrected) %>%
+    pull(test_ligand) %>% unique()
+
+  if (length(best_upstream_ligands) == 0) {
+    message(glue("  ⚠ Skipped: No high-ranking ligands found for {receiver_celltype} {condition_oi} vs {condition_reference}"))
+    return(NULL)
+  }
+
+  # ==== Visualizations ====
+  ligand_aupr_matrix <- ligand_activities %>% filter(test_ligand %in% best_upstream_ligands) %>%
+    column_to_rownames("test_ligand") %>% select(aupr_corrected) %>% arrange(aupr_corrected)
+  vis_ligand_aupr <- as.matrix(ligand_aupr_matrix, ncol = 1)
+
+  range_aupr <- range(vis_ligand_aupr, na.rm = TRUE)
+  
+  p_ligand_aupr <- make_heatmap_ggplot(
+    vis_ligand_aupr,
+    "Prioritized ligands", "Ligand activity",
+    legend_title = "AUPR", color = "darkorange"
+  ) +
+    # override scale to have fewer breaks
+    scale_fill_gradient(
+      low = "white", high = "darkorange",
+      breaks = pretty_breaks(n = 3)
+    ) +
+    guides(
+      fill = guide_colorbar(
+        barheight = unit(0.4, "cm"),  # longer bar
+        barwidth  = unit(4, "cm")
+      )
+    ) +
+    theme(
+      axis.text.x.top  = element_blank(),
+      legend.text      = element_text(size = 7),
+      legend.title     = element_text(size = 8),
+      legend.key.height = unit(0.4, "cm")
+    )
+
+  p_dotplot <- DotPlot(subset(seuratObj, cath_grouped_Minor_exp %in% sender_celltypes),
+                       features = rev(best_upstream_ligands), cols = "RdYlBu") + 
+    coord_flip() +
+    scale_y_discrete(position = "right")
+
+  celltype_order <- levels(Idents(seuratObj)) 
+  DE_table_top_ligands <- lapply(
+    celltype_order[celltype_order %in% sender_celltypes],
+    get_lfc_celltype, 
+    seurat_obj = seuratObj,
+    condition_colname = "cath_timepoint_response",
+    condition_oi = condition_oi,
+    condition_reference = condition_reference,
+    celltype_col = "cath_grouped_Minor_exp",
+    min.pct = 0, logfc.threshold = 0,
+    features = best_upstream_ligands 
+  ) %>% reduce(full_join) %>% column_to_rownames("gene")
+
+  vis_ligand_lfc <- as.matrix(DE_table_top_ligands[rev(best_upstream_ligands), , drop = FALSE])
+  range_lfc <- range(vis_ligand_lfc, na.rm = TRUE)
+
+  p_lfc <- make_threecolor_heatmap_ggplot(
+    vis_ligand_lfc,
+    "Prioritized ligands", "LFC in Sender",
+    low_color = "midnightblue", mid_color = "white",
+    mid = median(vis_ligand_lfc, na.rm = TRUE), high_color = "red",
+    legend_title = "LFC"
+  ) +
+    scale_fill_gradient2(
+      low = "midnightblue",
+      mid = "white",
+      high = "red",
+      midpoint = median(vis_ligand_lfc, na.rm = TRUE),
+      breaks = pretty_breaks(n = 3)
+    ) +
+    guides(
+      fill = guide_colorbar(
+        barheight = unit(0.4, "cm"),
+        barwidth  = unit(4, "cm")
+      )
+    ) +
+    theme(
+      legend.text       = element_text(size = 7),
+      legend.title      = element_text(size = 8),
+      legend.key.height = unit(0.4, "cm")
+    )
+
+  active_ligand_target_links_df <- best_upstream_ligands %>%
+    lapply(get_weighted_ligand_target_links,
+           geneset = geneset_oi,
+           ligand_target_matrix = ligand_target_matrix,
+           n = 100) %>%
+    bind_rows() %>% drop_na()
+
+  active_ligand_target_links <- prepare_ligand_target_visualization(
+    ligand_target_df = active_ligand_target_links_df,
+    ligand_target_matrix = ligand_target_matrix,
+    cutoff = 0.33) 
+
+  order_ligands <- intersect(best_upstream_ligands, colnames(active_ligand_target_links)) %>% rev()
+  order_targets <- active_ligand_target_links_df$target %>% unique() %>% intersect(rownames(active_ligand_target_links))
+
+  vis_ligand_target <- t(active_ligand_target_links[order_targets,order_ligands])
+
+  range_lt <- range(vis_ligand_target, na.rm = TRUE)
+  
+  p_ligand_target <- make_heatmap_ggplot(
+    vis_ligand_target, "Prioritized ligands", "Predicted target genes",
+    color = "purple", legend_title = "Regulatory potential"
+  ) +
+    scale_fill_gradient2(
+      low = "whitesmoke",
+      mid = "white",
+      high = "purple",
+      midpoint = median(vis_ligand_target, na.rm = TRUE),
+      breaks = pretty_breaks(n = 3)
+    ) +
+    guides(
+      fill = guide_colorbar(
+        barheight = unit(0.4, "cm"),
+        barwidth  = unit(4, "cm")
+      )
+    ) +
+    theme(
+      legend.text       = element_text(size = 7),
+      legend.title      = element_text(size = 8),
+      legend.key.height = unit(0.4, "cm")
+    )
+
+  figures_without_legend <- cowplot::plot_grid(
+    p_ligand_aupr + theme(legend.position = "none"),
+    p_dotplot + theme(legend.position = "none",
+                      axis.ticks = element_blank(),
+                      axis.title.y = element_blank(),
+                      axis.title.x = element_text(size = 12),
+                      axis.text.y = element_text(size = 9),
+                      axis.text.x = element_text(size = 9,  angle = 90, hjust = 0)) +
+      ylab("Expression in Sender"),
+    p_lfc + theme(legend.position = "none",
+                  axis.title.y = element_blank()),
+    p_ligand_target + theme(legend.position = "none",
+                            axis.title.y = element_blank()),
+    align = "hv",
+    nrow = 1,
+    rel_widths = c(ncol(vis_ligand_aupr)+6, ncol(vis_ligand_lfc)+7, ncol(vis_ligand_lfc)+8, ncol(vis_ligand_target)))
+
+  legends <- cowplot::plot_grid(
+    ggpubr::as_ggplot(ggpubr::get_legend(p_ligand_aupr)),
+    ggpubr::as_ggplot(ggpubr::get_legend(p_dotplot)),
+    ggpubr::as_ggplot(ggpubr::get_legend(p_lfc)),
+    ggpubr::as_ggplot(ggpubr::get_legend(p_ligand_target)),
+    nrow = 1,
+    align = "h", rel_widths = c(1.5, 1, 1, 1))
+
+  combined_plot_raw <- cowplot::plot_grid(
+  figures_without_legend, legends,
+  rel_heights = c(10, 5), nrow = 2, align = "hv"
+)
+
+  combined_plot <- cowplot::ggdraw(combined_plot_raw) +
+    theme(
+      plot.margin = margin(t = 5.5, r = 40, b = 5.5, l = 5.5, unit = "pt")
+    )
+  
+  ggsave(
+    output_file,
+    plot = combined_plot,
+    width = 30, height = 22, units = "cm",
+    dpi = 500,
+    limitsize = FALSE
+  )
+
+  if (save_tables) {
+    dir.create("tables", showWarnings = FALSE)
+    write_csv(DE_table_receiver, file.path("tables", paste0("DE_table_", receiver_celltype, "_", condition_oi, "_vs_", condition_reference, ".csv")))
+    write_csv(ligand_activities, file.path("tables", paste0("ligand_activities_", receiver_celltype, "_", condition_oi, "_vs_", condition_reference, ".csv")))
+  }
+
+  write_csv(tibble(receiver = receiver_celltype,
+                   condition_oi = condition_oi,
+                   condition_reference = condition_reference,
+                   top_ligands = paste(best_upstream_ligands, collapse = ";")),
+            summary_file, append = file.exists(summary_file))
+
+  message(glue("  ✅ Completed: {receiver_celltype} {condition_oi} vs {condition_reference}"))
+}
+```
+
+
+```{r}
+### Test
+run_nichenet_analysis(
+  receiver_celltype = "Melanocyte",
+  sender_celltypes = c("CD4_T", "B_cell", "Endothelial", "DC","Macrophage", "Melanocyte", "Lymph_endo", "Treg"),
+  condition_oi = "PRE_Resistant",
+  condition_reference = "PRE_Responsive",
+  seuratObj = seuratObj,
+  output_file = "plots/nichenet/nichenet_Melanocyte_PRE_Resistant_vs_PRE_Responsive.png",
+  save_tables = TRUE,
+  summary_file = "nichenet_data/nichenet_results_tables/nichenet_Melanocyte_ligand_summary.csv"
+)
+```
+
+```{r}
+### Test
+run_nichenet_analysis(
+  receiver_celltype = "Melanocyte",
+  sender_celltypes = c("CD4_T", "B_cell", "Endothelial", "DC","Macrophage", "Melanocyte", "Lymph_endo", "Treg"),
+  condition_oi = "PROG_Resistant",
+  condition_reference = "PRE_Responsive",
+  seuratObj = seuratObj,
+  output_file = "plots/nichenet/nichenet_Melanocyte_PROG_Resistant_vs_PRE_Responsive.png",
+  save_tables = TRUE,
+  summary_file = "nichenet_data/nichenet_results_tables/nichenet_Melanocyte_ligand_summary_PRE-PROG.csv"
+)
+```
+
+```{r}
+# Define all receiver cell types to test (excluding Endothelial if already done)
+receiver_celltypes <- c("DC", "Macrophage", "B_cell", "Treg", "CD8_T", "CD4_T", "Lymph_endo", "Melanocyte")
+
+# All possible pairwise comparisons between your 3 groups
+conditions <- c("PRE_Responsive", "PRE_Resistant", "PROG_Resistant")
+pairwise_conditions <- combn(conditions, 2, simplify = FALSE)
+
+# Optional: load your Seurat object
+#seuratObj <- readRDS("seurat_objects/ITM_n24_AllCells_PDEMUX_cleaned_filtered_CODEX_markers_9May25.rds")
+
+# Run NicheNet for each receiver + condition pair
+for (receiver in receiver_celltypes) {
+  sender_celltypes <- setdiff(unique(seuratObj@meta.data$cath_grouped_Minor_exp), receiver)
+
+  for (pair in pairwise_conditions) {
+    condition_reference <- pair[1]
+    condition_oi <- pair[2]
+
+    # Define output filename
+    output_file <- paste0("plots/nichenet_", receiver, "_", condition_oi, "_vs_", condition_reference, ".png")
+
+    # Run analysis
+    tryCatch({
+      run_nichenet_analysis(
+        receiver_celltype = receiver,
+        sender_celltypes = sender_celltypes,
+        condition_oi = condition_oi,
+        condition_reference = condition_reference,
+        seuratObj = seuratObj,
+        output_file = output_file,
+        save_tables = TRUE,
+        summary_file = "nichenet_ligand_summary.csv"
+      )
+    }, error = function(e) {
+      message(paste("Failed for", receiver, condition_oi, "vs", condition_reference, ":", e$message))
+    })
+  }
+}
+```
+

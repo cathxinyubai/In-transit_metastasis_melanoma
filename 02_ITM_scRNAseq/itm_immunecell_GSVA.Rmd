@@ -1,0 +1,129 @@
+---
+title: "bcell_scGSVA"
+author: "cath"
+date: "2024-10-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+#library(devtools)
+#install_github("guokai8/scGSVA")
+
+library(scGSVA)
+
+b_obj <- readRDS("ITM_Bcell_obj_PDEMUX_cleaned_filtered_cath-3oct24.rds")
+
+pre_b_obj<- subset(b_obj, subset = timepoint == "PRE")
+
+hsko<-buildAnnot(species="human",keytype="SYMBOL",anntype="KEGG")
+
+res<-scgsva(pre_b_obj,hsko,method="ssgsea") ##or use UCell
+```
+
+```{r}
+## Find significant pathways across groups
+pathways <- findPathway(res, group = "cath_timepoint_response")
+
+sig_pathways <- sigPathway(res, group = "cath_timepoint_response")
+```
+
+## Extract specific pathways with expression value
+genes(res, features = "target pathway")
+
+
+
+
+## myeloid GSVA
+
+```{r}
+myeloid_obj<- readRDS("ITM_Myeloid_Obj_PDEMUX_cleaned_cath-11sep24.rds")
+
+pre_myeloid_obj <- subset(myeloid_obj, subset = timepoint == "PRE")
+
+myeloid_res <- scgsva(pre_myeloid_obj, hsko, method="ssgsea") ##or use UCell
+
+myeloid_pathways <- findPathway(myeloid_res, group = "cath_timepoint_response")
+
+myeloid_sig_pathways <- sigPathway(myeloid_res, group = "cath_timepoint_response")
+```
+```{r}
+png("plots/myeloid/PRE_response_vs_resistant_GSVA_heatmap.png", width = 15, height = 40, units = "cm", res = 300)
+Heatmap(myeloid_res, group_by = "Minor_exp")
+dev.off()
+```
+```{r}
+ridgePlot(myeloid_res, features = "Toll.like.receptor.signaling.pathway", group_by = "Minor_exp", split.by = "cath_timepoint_response")
+
+ridgePlot(myeloid_res, features = "Toll.like.receptor.signaling.pathway", group_by = "cath_timepoint_response", split.by = "Minor_exp")
+```
+
+```{r}
+pre_dc_obj <- subset(pre_myeloid_obj, subset = Minor_exp %in% c("DC1", "DC2", "pDC", "mregDC"))
+
+pre_dc_res <- scgsva(pre_dc_obj, hsko, method="ssgsea") ##or use UCell
+
+pre_dc_pathways <- findPathway(pre_dc_res, group = "cath_timepoint_response")
+
+pre_dc_sig_pathways <- sigPathway(pre_dc_res, group = "cath_timepoint_response")
+```
+
+```{r}
+ridgePlot(pre_dc_res, features = "JAK.STAT.signaling.pathway", group_by = "Minor_exp", split.by = "cath_timepoint_response")
+
+ridgePlot(pre_dc_res, features = "JAK.STAT.signaling.pathway", group_by = "cath_timepoint_response", split.by = "Minor_exp")
+```
+
+```{r}
+# Filter by adj.P.Val < 0.05
+filtered_dc_pathways <- pre_dc_pathways[pre_dc_pathways$adj.P.Val < 0.05, ]
+
+# Select top 50 absolute logFC
+top_dc_pathways <- filtered_dc_pathways[order(abs(filtered_dc_pathways$logFC), decreasing = TRUE), ][1:50, ]
+
+# Extract row names (pathways) for heatmap features
+dc_top_pw <- rownames(top_dc_pathways)
+
+# Use these features in the heatmap
+Heatmap(pre_dc_res, features = dc_top_pw, group_by = "cath_timepoint_response", cluster_cols = F)
+```
+
+```{r}
+pre_monomacro_obj <- subset(pre_myeloid_obj, subset = Minor_exp %in% c("Monocyte", "CXCL10_Macrophage", "SPP1_Macrophage", "Cycling M"))
+
+pre_monomacro_res <- scgsva(pre_monomacro_obj, hsko, method="ssgsea") ##or use UCell
+
+pre_monomacro_pathways <- findPathway(pre_monomacro_res, group = "cath_timepoint_response")
+
+pre_monomacro_sig_pathways <- sigPathway(pre_monomacro_res, group = "cath_timepoint_response")
+```
+
+```{r}
+ridgePlot(pre_monomacro_res, features = "NOD.like.receptor.signaling.pathway", group_by = "Minor_exp", split.by = "cath_timepoint_response")
+
+ridgePlot(pre_monomacro_res, features = "NOD.like.receptor.signaling.pathway", group_by = "cath_timepoint_response", split.by = "Minor_exp")
+```
+
+```{r}
+ridgePlot(pre_monomacro_res, features = "Chemokine.signaling.pathway", group_by = "Minor_exp", split.by = "cath_timepoint_response")
+
+ridgePlot(pre_monomacro_res, features = "Chemokine.signaling.pathway", group_by = "cath_timepoint_response", split.by = "Minor_exp")
+```
+```{r}
+# Filter by adj.P.Val < 0.05
+filtered_monomacro_pathways <- pre_monomacro_pathways[pre_monomacro_pathways$adj.P.Val < 0.05, ]
+
+# Select top 50 absolute logFC
+top_monomacro_pathways <- filtered_monomacro_pathways[order(abs(filtered_monomacro_pathways$logFC), decreasing = TRUE), ][1:50, ]
+
+# Extract row names (pathways) for heatmap features
+monomacro_top_pw <- rownames(top_monomacro_pathways)
+
+# Use these features in the heatmap
+Heatmap(pre_monomacro_res, features = monomacro_top_pw, group_by = "cath_timepoint_response", cluster_cols = F)
+```
