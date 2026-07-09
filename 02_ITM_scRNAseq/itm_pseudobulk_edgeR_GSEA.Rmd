@@ -1,0 +1,1374 @@
+---
+title: "itm_pseudobulk_edgeR_GSEA"
+output: html_document
+date: "2026-05-13"
+---
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(Matrix)
+library(edgeR)
+library(limma)
+library(ggplot2)
+
+# Optional but useful for pathway enrichment
+library(msigdbr)
+library(fgsea)
+
+meta <- itm_obj@meta.data
+
+celltype_col <- "cath_grouped_Minor_exp"
+group_col    <- "cath_timepoint_response"
+sample_col   <- "SAMPLE_ID"
+
+celltypes_to_test <- c(
+  "Melanocyte",
+  "CD8_T",
+  "Endothelial",
+  "Macrophage"
+)
+
+group_order <- c(
+  "PRE_Responsive",
+  "PRE_Resistant",
+  "PROG_Resistant"
+)
+
+output_dir <- "ITM_rebuttal/scRNAseq_pseudobulk_DE"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+stopifnot(all(c(celltype_col, group_col, sample_col) %in% colnames(meta)))
+
+table(meta[[group_col]])
+table(meta[[celltype_col]])
+```
+
+```{r}
+pb_sep <- "||"
+
+itm_obj$pb_celltype <- itm_obj@meta.data[[celltype_col]]
+itm_obj$pb_group    <- itm_obj@meta.data[[group_col]]
+itm_obj$pb_sample   <- itm_obj@meta.data[[sample_col]]
+
+itm_obj$pb_id <- paste(
+  itm_obj$pb_sample,
+  itm_obj$pb_celltype,
+  sep = pb_sep
+)
+
+head(itm_obj$pb_id)
+```
+
+```{r}
+DefaultAssay(itm_obj) <- "RNA"
+
+pb_counts_list <- AggregateExpression(
+  object = itm_obj,
+  assays = "RNA",
+  group.by = "pb_id",
+  slot = "counts",
+  return.seurat = FALSE
+)
+
+pb_counts <- pb_counts_list$RNA
+
+dim(pb_counts)
+pb_counts[1:5, 1:5]
+```
+
+```{r}
+pb_meta <- data.frame(
+  pb_id = colnames(pb_counts)
+) %>%
+  separate(
+    pb_id,
+    into = c("SAMPLE_ID", "celltype"),
+    sep = "\\|\\|",
+    remove = FALSE
+  ) %>%
+  left_join(
+    meta %>%
+      distinct(
+        !!sym(sample_col),
+        !!sym(group_col)
+      ) %>%
+      rename(
+        group = !!sym(group_col)
+      ),
+    by = "SAMPLE_ID"
+  )
+
+pb_meta$group <- factor(pb_meta$group, levels = group_order)
+pb_meta$celltype <- factor(pb_meta$celltype)
+
+rownames(pb_meta) <- pb_meta$pb_id
+pb_meta <- pb_meta[colnames(pb_counts), ]
+
+head(pb_meta)
+table(pb_meta$celltype, pb_meta$group)
+```
+
+
+```{r}
+# Build pseudobulk metadata directly from original cell metadata
+pb_meta_from_cells <- meta %>%
+  mutate(
+    pb_id_original = paste(
+      .data[[sample_col]],
+      .data[[celltype_col]],
+      sep = pb_sep
+    )
+  ) %>%
+  group_by(pb_id_original) %>%
+  summarise(
+    SAMPLE_ID = first(.data[[sample_col]]),
+    celltype_original = first(.data[[celltype_col]]),
+    group = first(.data[[group_col]]),
+    n_cells = n(),
+    .groups = "drop"
+  )
+
+head(pb_meta_from_cells)
+```
+
+```{r}
+# Match Seurat's sanitised pseudobulk column names
+pb_meta_from_cells <- pb_meta_from_cells %>%
+  mutate(
+    pb_id = gsub("_", "-", pb_id_original)
+  )
+
+head(pb_meta_from_cells[, c("pb_id_original", "pb_id")])
+head(colnames(pb_counts))
+```
+
+```{r}
+pb_meta <- pb_meta %>%
+  mutate(
+    celltype = celltype_original,
+    group = factor(group, levels = group_order),
+    celltype = factor(celltype)
+  )
+
+# reset rownames after dplyr operations
+pb_meta <- as.data.frame(pb_meta)
+rownames(pb_meta) <- pb_meta$pb_id
+
+# reorder again just to be safe
+pb_meta <- pb_meta[colnames(pb_counts), , drop = FALSE]
+
+# final check
+ncol(pb_counts)
+nrow(pb_meta)
+all(colnames(pb_counts) == rownames(pb_meta))
+sum(is.na(pb_meta$group))
+table(pb_meta$celltype, pb_meta$group)
+```
+
+
+```{r}
+pb_ncells <- meta %>%
+  mutate(
+    pb_id_original = paste(
+      .data[[sample_col]],
+      .data[[celltype_col]],
+      sep = pb_sep
+    ),
+    pb_id = gsub("_", "-", pb_id_original)
+  ) %>%
+  count(pb_id, name = "n_cells_check")
+```
+
+```{r}
+colnames(pb_meta)
+head(pb_meta[, c("pb_id", "celltype", "group", "n_cells")])
+```
+
+```{r}
+summary(pb_meta$n_cells)
+
+pb_meta %>%
+  filter(celltype %in% celltypes_to_test) %>%
+  group_by(celltype, group) %>%
+  summarise(
+    n_pb_all = n(),
+    n_pb_ge5 = sum(n_cells >= 5),
+    n_pb_ge10 = sum(n_cells >= 10),
+    median_cells = median(n_cells),
+    min_cells = min(n_cells),
+    max_cells = max(n_cells),
+    .groups = "drop"
+  )
+```
+
+```{r}
+run_pseudobulk_edger <- function(
+    counts,
+    meta,
+    celltype_use,
+    group_col = "group",
+    celltype_col = "celltype",
+    min_cells_per_pb = 5,
+    min_samples_per_group = 2,
+    output_dir = NULL
+) {
+  
+  message("Running pseudobulk DE for: ", celltype_use)
+  
+  # Subset to one cell type and remove very low-cell pseudobulk samples
+  keep_pb <- meta[[celltype_col]] == celltype_use & meta$n_cells >= min_cells_per_pb
+  
+  meta_ct <- meta[keep_pb, , drop = FALSE]
+  counts_ct <- counts[, rownames(meta_ct), drop = FALSE]
+  
+  # Drop unused group levels
+  meta_ct[[group_col]] <- droplevels(meta_ct[[group_col]])
+  
+  # Check sample support
+  group_counts <- table(meta_ct[[group_col]])
+  print(group_counts)
+  
+  if (length(group_counts) < 2) {
+    stop("Fewer than 2 groups available after filtering for ", celltype_use)
+  }
+  
+  if (any(group_counts < min_samples_per_group)) {
+    warning(
+      "One or more groups have fewer than ",
+      min_samples_per_group,
+      " pseudobulk samples for ",
+      celltype_use,
+      ". Interpret carefully."
+    )
+  }
+  
+  # Create DGEList
+  y <- edgeR::DGEList(counts = counts_ct)
+  
+  # Design matrix
+  design <- model.matrix(~ 0 + meta_ct[[group_col]])
+  colnames(design) <- levels(meta_ct[[group_col]])
+  
+  # Filter lowly expressed genes
+  keep_genes <- edgeR::filterByExpr(y, design = design)
+  y <- y[keep_genes, , keep.lib.sizes = FALSE]
+  
+  # Normalisation
+  y <- edgeR::calcNormFactors(y, method = "TMM")
+  
+  # Estimate dispersion and fit quasi-likelihood model
+  y <- edgeR::estimateDisp(y, design)
+  fit <- edgeR::glmQLFit(y, design)
+  
+  # Only create contrasts if both groups exist
+  available_groups <- colnames(design)
+  
+  contrast_defs <- list()
+  
+  if (all(c("PRE_Resistant", "PRE_Responsive") %in% available_groups)) {
+    contrast_defs[["PRE_Resistant_vs_PRE_Responsive"]] <-
+      limma::makeContrasts(PRE_Resistant - PRE_Responsive, levels = design)
+  }
+  
+  if (all(c("PROG_Resistant", "PRE_Responsive") %in% available_groups)) {
+    contrast_defs[["PROG_Resistant_vs_PRE_Responsive"]] <-
+      limma::makeContrasts(PROG_Resistant - PRE_Responsive, levels = design)
+  }
+  
+  if (all(c("PROG_Resistant", "PRE_Resistant") %in% available_groups)) {
+    contrast_defs[["PROG_Resistant_vs_PRE_Resistant"]] <-
+      limma::makeContrasts(PROG_Resistant - PRE_Resistant, levels = design)
+  }
+  
+  if (length(contrast_defs) == 0) {
+    stop("No valid contrasts available for ", celltype_use)
+  }
+  
+  # Run DE tests
+  de_results <- list()
+  
+  for (contrast_name in names(contrast_defs)) {
+    
+    qlf <- edgeR::glmQLFTest(fit, contrast = contrast_defs[[contrast_name]])
+    
+    res <- edgeR::topTags(qlf, n = Inf)$table %>%
+      tibble::rownames_to_column("gene") %>%
+      dplyr::mutate(
+        celltype = celltype_use,
+        contrast = contrast_name
+      )
+    
+    de_results[[contrast_name]] <- res
+    
+    if (!is.null(output_dir)) {
+      write.csv(
+        res,
+        file.path(
+          output_dir,
+          paste0(
+            "DE_edgeR_",
+            celltype_use,
+            "_",
+            contrast_name,
+            ".csv"
+          )
+        ),
+        row.names = FALSE
+      )
+    }
+  }
+  
+  return(list(
+    celltype = celltype_use,
+    meta = meta_ct,
+    counts = counts_ct,
+    y = y,
+    design = design,
+    fit = fit,
+    de = de_results
+  ))
+}
+```
+
+
+```{r}
+de_results_all <- list()
+
+for (ct in celltypes_to_test) {
+  de_results_all[[ct]] <- run_pseudobulk_edger(
+    counts = pb_counts,
+    meta = pb_meta,
+    celltype_use = ct,
+    group_col = "group",
+    celltype_col = "celltype",
+    min_cells_per_pb = 5,
+    min_samples_per_group = 2,
+    output_dir = output_dir
+  )
+}
+```
+
+```{r}
+lapply(de_results_all, function(x) table(x$meta$group))
+```
+
+```{r}
+de_all_df <- dplyr::bind_rows(
+  lapply(de_results_all, function(x) {
+    dplyr::bind_rows(x$de)
+  })
+)
+
+de_summary <- de_all_df %>%
+  dplyr::mutate(
+    sig_FDR_0.05 = FDR < 0.05,
+    sig_FDR_0.10 = FDR < 0.10,
+    up = logFC > 0,
+    down = logFC < 0
+  ) %>%
+  dplyr::group_by(celltype, contrast) %>%
+  dplyr::summarise(
+    n_genes_tested = dplyr::n(),
+    n_FDR_0.05 = sum(sig_FDR_0.05),
+    n_FDR_0.10 = sum(sig_FDR_0.10),
+    n_up_FDR_0.05 = sum(sig_FDR_0.05 & up),
+    n_down_FDR_0.05 = sum(sig_FDR_0.05 & down),
+    .groups = "drop"
+  )
+
+de_summary
+```
+
+```{r}
+write.csv(
+  de_all_df,
+  file.path(output_dir, "DE_edgeR_all_celltypes_all_contrasts.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  de_summary,
+  file.path(output_dir, "DE_edgeR_summary.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+library(msigdbr)
+library(fgsea)
+library(dplyr)
+
+hallmark_sets <- msigdbr(
+  species = "Homo sapiens",
+  category = "H"
+) %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+run_fgsea_from_de <- function(
+    de_df,
+    pathways,
+    minSize = 10,
+    maxSize = 500
+) {
+  
+  ranks <- de_df %>%
+    filter(!is.na(PValue), !is.na(logFC)) %>%
+    mutate(rank_metric = sign(logFC) * -log10(PValue)) %>%
+    arrange(desc(rank_metric)) %>%
+    distinct(gene, .keep_all = TRUE)
+  
+  stats <- ranks$rank_metric
+  names(stats) <- ranks$gene
+  
+  stats <- stats[is.finite(stats)]
+  stats <- sort(stats, decreasing = TRUE)
+  
+  fg <- fgsea(
+    pathways = pathways,
+    stats = stats,
+    minSize = minSize,
+    maxSize = maxSize
+  )
+  
+  fg <- as.data.frame(fg) %>%
+    arrange(padj)
+  
+  fg$leadingEdge <- sapply(fg$leadingEdge, paste, collapse = ";")
+  
+  fg
+}
+```
+
+```{r}
+gsea_hallmark_all <- list()
+
+for (ct in names(de_results_all)) {
+  for (contrast_name in names(de_results_all[[ct]]$de)) {
+    
+    message("Running Hallmark GSEA: ", ct, " - ", contrast_name)
+    
+    de_df <- de_results_all[[ct]]$de[[contrast_name]]
+    
+    fg <- run_fgsea_from_de(
+      de_df = de_df,
+      pathways = hallmark_sets,
+      minSize = 10,
+      maxSize = 500
+    ) %>%
+      mutate(
+        celltype = ct,
+        contrast = contrast_name,
+        collection = "Hallmark"
+      )
+    
+    gsea_hallmark_all[[paste(ct, contrast_name, sep = "__")]] <- fg
+  }
+}
+
+gsea_hallmark_df <- bind_rows(gsea_hallmark_all)
+
+write.csv(
+  gsea_hallmark_df,
+  file.path(output_dir, "GSEA_Hallmark_all_celltypes_all_contrasts.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+pathways_of_interest <- c(
+  "HALLMARK_HYPOXIA",
+  "HALLMARK_ANGIOGENESIS",
+  "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+  "HALLMARK_TGF_BETA_SIGNALING",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+  "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+  "HALLMARK_INFLAMMATORY_RESPONSE",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "HALLMARK_GLYCOLYSIS",
+  "HALLMARK_FATTY_ACID_METABOLISM",
+  "HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+  "HALLMARK_COMPLEMENT",
+  "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+  "HALLMARK_IL2_STAT5_SIGNALING"
+)
+
+gsea_story <- gsea_hallmark_df %>%
+  filter(pathway %in% pathways_of_interest) %>%
+  arrange(celltype, contrast, padj)
+
+write.csv(
+  gsea_story,
+  file.path(output_dir, "GSEA_Hallmark_story_pathways.csv"),
+  row.names = FALSE
+)
+
+gsea_story
+```
+
+```{r}
+genes_of_interest <- c(
+  "BNIP3", "ADM", "SLC16A3", "HIF3A", "VEGFA", "VEGFC",
+  "DDIT4", "HILPDA", "ARNT",
+  "IFNG", "GZMB", "GZMA", "GZMK", "PRF1", "NKG7",
+  "CRTAM", "SIRPG",
+  "PECAM1", "VWF", "KDR", "FLT4", "PROX1", "PDPN",
+  "SELE", "ICAM1", "THBS1", "LGALS9", "PLAU", "PLAUR"
+)
+
+key_gene_results <- de_all_df %>%
+  filter(gene %in% genes_of_interest) %>%
+  arrange(celltype, contrast, FDR)
+
+write.csv(
+  key_gene_results,
+  file.path(output_dir, "DE_edgeR_key_genes_of_interest.csv"),
+  row.names = FALSE
+)
+
+key_gene_results
+```
+
+```{r}
+library(stringr)
+gsea_plot_df <- gsea_story %>%
+  mutate(
+    pathway_clean = pathway %>%
+      str_replace("^HALLMARK_", "") %>%
+      str_replace_all("_", " ") %>%
+      str_to_title(),
+    
+    contrast_clean = case_when(
+      contrast == "PRE_Resistant_vs_PRE_Responsive" ~ "PRE R vs PRE Resp",
+      contrast == "PROG_Resistant_vs_PRE_Responsive" ~ "PROG R vs PRE Resp",
+      contrast == "PROG_Resistant_vs_PRE_Resistant" ~ "PROG R vs PRE R",
+      TRUE ~ contrast
+    ),
+    
+    sig_label = case_when(
+      padj < 0.001 ~ "***",
+      padj < 0.01  ~ "**",
+      padj < 0.05  ~ "*",
+      padj < 0.10  ~ ".",
+      TRUE ~ ""
+    ),
+    
+    neglog10_padj = -log10(padj)
+  )
+```
+
+```{r}
+library(ggplot2) 
+p_gsea_heatmap <- ggplot(
+  gsea_plot_df,
+  aes(
+    x = contrast_clean,
+    y = pathway_clean,
+    fill = NES
+  )
+) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sig_label), size = 4) +
+  facet_wrap(~ celltype, scales = "free_x") +
+  scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "white",
+    high = "#D7191C",
+    midpoint = 0,
+    name = "NES"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 9),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    strip.text = element_text(face = "bold"),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.4)
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Pseudobulk GSEA of selected Hallmark pathways"
+  )
+
+p_gsea_heatmap
+```
+
+```{r}
+ggsave(
+  file.path(output_dir, "GSEA_story_pathways_NES_heatmap.png"),
+  plot = p_gsea_heatmap,
+  width = 6,
+  height = 7,
+  dpi = 300
+)
+```
+
+```{r}
+p_gsea_dot <- ggplot(
+  gsea_plot_df,
+  aes(
+    x = contrast_clean,
+    y = pathway_clean,
+    colour = NES,
+    size = neglog10_padj
+  )
+) +
+  geom_point(alpha = 0.9) +
+  facet_wrap(~ celltype, scales = "free_x") +
+  scale_colour_gradient2(
+    low = "#2C7BB6",
+    mid = "grey90",
+    high = "#D7191C",
+    midpoint = 0,
+    name = "NES"
+  ) +
+  scale_size_continuous(
+    range = c(1, 5),
+    name = "-log10(FDR)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 9),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    strip.text = element_text(face = "bold"),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.4)
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Pseudobulk GSEA of selected Hallmark pathways"
+  )
+
+p_gsea_dot
+```
+
+```{r}
+ggsave(
+  file.path(output_dir, "GSEA_story_pathways_dotplot.png"),
+  plot = p_gsea_dot,
+  width = 6,
+  height = 7,
+  dpi = 300
+)
+```
+
+```{r}
+main_story_pathways <- c(
+  "HALLMARK_HYPOXIA",
+  "HALLMARK_ANGIOGENESIS",
+  "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+  "HALLMARK_TGF_BETA_SIGNALING",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+  "HALLMARK_INFLAMMATORY_RESPONSE",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "HALLMARK_GLYCOLYSIS",
+  "HALLMARK_FATTY_ACID_METABOLISM",
+  "HALLMARK_OXIDATIVE_PHOSPHORYLATION"
+)
+
+gsea_main_df <- gsea_plot_df %>%
+  filter(pathway %in% main_story_pathways)
+
+p_gsea_main <- ggplot(
+  gsea_main_df,
+  aes(
+    x = contrast_clean,
+    y = pathway_clean,
+    fill = NES
+  )
+) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sig_label), size = 4) +
+  facet_wrap(~ celltype, scales = "free_x") +
+  scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "white",
+    high = "#D7191C",
+    midpoint = 0,
+    name = "NES"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 9),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    strip.text = element_text(face = "bold"),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.4)
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Key pseudobulk GSEA pathways"
+  )
+
+p_gsea_main
+```
+
+```{r}
+ggsave(
+  file.path(output_dir, "GSEA_main_story_pathways_heatmap.png"),
+  plot = p_gsea_main,
+  width = 5,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r}
+key_gene_plot_df <- key_gene_results %>%
+  mutate(
+    contrast_clean = case_when(
+      contrast == "PRE_Resistant_vs_PRE_Responsive" ~ "PRE R vs PRE Resp",
+      contrast == "PROG_Resistant_vs_PRE_Responsive" ~ "PROG R vs PRE Resp",
+      contrast == "PROG_Resistant_vs_PRE_Resistant" ~ "PROG R vs PRE R",
+      TRUE ~ contrast
+    ),
+    
+    sig_label = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01  ~ "**",
+      FDR < 0.05  ~ "*",
+      FDR < 0.10  ~ ".",
+      TRUE ~ ""
+    ),
+    
+    neglog10_fdr = -log10(FDR),
+    
+    gene_group = case_when(
+      gene %in% c("BNIP3", "ADM", "SLC16A3", "HIF3A", "VEGFA", "VEGFC", "DDIT4", "HILPDA", "ARNT") ~ "Hypoxia / angiogenesis",
+      gene %in% c("IFNG", "GZMB", "GZMA", "GZMK", "PRF1", "NKG7", "CRTAM", "SIRPG") ~ "CD8 activation / cytotoxicity",
+      gene %in% c("PECAM1", "VWF", "KDR", "FLT4", "PROX1", "PDPN", "SELE", "ICAM1") ~ "Endothelial / lymphatic",
+      gene %in% c("THBS1", "LGALS9", "PLAU", "PLAUR") ~ "ECM / tolerogenic",
+      TRUE ~ "Other"
+    )
+  )
+```
+
+```{r}
+p_key_gene_heatmap <- ggplot(
+  key_gene_plot_df,
+  aes(
+    x = contrast_clean,
+    y = gene,
+    fill = logFC
+  )
+) +
+  geom_tile(colour = "white", linewidth = 0.35) +
+  geom_text(aes(label = sig_label), size = 3.5) +
+  facet_grid(
+    gene_group ~ celltype,
+    scales = "free",
+    space = "free"
+  ) +
+  scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "white",
+    high = "#D7191C",
+    midpoint = 0,
+    name = "logFC"
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 8),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    strip.text = element_text(face = "bold", size = 7),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.3)
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Key genes from pseudobulk DE"
+  )
+
+p_key_gene_heatmap
+```
+
+```{r}
+ggsave(
+  file.path(output_dir, "DE_key_genes_logFC_heatmap.png"),
+  plot = p_key_gene_heatmap,
+  width = 4.5,
+  height = 7.5,
+  dpi = 300
+)
+```
+
+```{r}
+p_key_gene_dot <- ggplot(
+  key_gene_plot_df,
+  aes(
+    x = contrast_clean,
+    y = gene,
+    colour = logFC,
+    size = neglog10_fdr
+  )
+) +
+  geom_point(alpha = 0.9) +
+  facet_grid(
+    gene_group ~ celltype,
+    scales = "free",
+    space = "free"
+  ) +
+  scale_colour_gradient2(
+    low = "#2C7BB6",
+    mid = "grey90",
+    high = "#D7191C",
+    midpoint = 0,
+    name = "logFC"
+  ) +
+  scale_size_continuous(
+    range = c(1, 5),
+    name = "-log10(FDR)"
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 8),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    strip.text = element_text(face = "bold", size = 7),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.3)
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Key genes from pseudobulk DE"
+  )
+
+p_key_gene_dot
+```
+
+```{r}
+ggsave(
+  file.path(output_dir, "DE_key_genes_logFC_dotplot.png"),
+  plot = p_key_gene_dot,
+  width = 4.5,
+  height = 7.5,
+  dpi = 300
+)
+```
+
+```{r}
+mel_hypoxia_genes <- c(
+  "BNIP3", "ADM", "SLC16A3", "HIF3A",
+  "VEGFA", "VEGFC", "DDIT4", "HILPDA", "ARNT"
+)
+
+mel_df <- key_gene_plot_df %>%
+  filter(
+    celltype == "Melanocyte",
+    gene %in% mel_hypoxia_genes
+  )
+
+p_mel_hypoxia <- ggplot(
+  mel_df,
+  aes(
+    x = contrast_clean,
+    y = factor(gene, levels = rev(mel_hypoxia_genes)),
+    fill = logFC
+  )
+) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sig_label), size = 4) +
+  scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "white",
+    high = "#D7191C",
+    midpoint = 0,
+    name = "logFC"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.4)
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Melanoma hypoxia and angiogenesis genes"
+  )
+
+p_mel_hypoxia
+```
+
+```{r}
+cd8_genes <- c(
+  "IFNG", "GZMB", "GZMA", "GZMK",
+  "PRF1", "NKG7", "CRTAM", "SIRPG"
+)
+
+cd8_df <- key_gene_plot_df %>%
+  filter(
+    celltype == "CD8_T",
+    gene %in% cd8_genes
+  )
+
+p_cd8_genes <- ggplot(
+  cd8_df,
+  aes(
+    x = contrast_clean,
+    y = factor(gene, levels = rev(cd8_genes)),
+    fill = logFC
+  )
+) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sig_label), size = 4) +
+  scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "white",
+    high = "#D7191C",
+    midpoint = 0,
+    name = "logFC"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.4)
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "CD8 T-cell cytotoxic and IFN-associated genes"
+  )
+
+p_cd8_genes
+```
+
+```{r}
+library(forcats)
+top_gsea <- gsea_hallmark_df %>%
+  group_by(celltype, contrast) %>%
+  arrange(padj, .by_group = TRUE) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  mutate(
+    pathway_clean = pathway %>%
+      str_replace("^HALLMARK_", "") %>%
+      str_replace_all("_", " ") %>%
+      str_to_title(),
+    contrast_clean = case_when(
+      contrast == "PRE_Resistant_vs_PRE_Responsive" ~ "PRE R vs PRE Resp",
+      contrast == "PROG_Resistant_vs_PRE_Responsive" ~ "PROG R vs PRE Resp",
+      contrast == "PROG_Resistant_vs_PRE_Resistant" ~ "PROG R vs PRE R",
+      TRUE ~ contrast
+    ),
+    neglog10_padj = -log10(padj)
+  )
+
+p_top_gsea <- ggplot(
+  top_gsea,
+  aes(
+    x = NES,
+    y = fct_reorder(pathway_clean, NES),
+    colour = NES,
+    size = neglog10_padj
+  )
+) +
+  geom_point() +
+  facet_grid(celltype ~ contrast_clean, scales = "free_y") +
+  scale_colour_gradient2(
+    low = "#2C7BB6",
+    mid = "grey90",
+    high = "#D7191C",
+    midpoint = 0,
+    name = "NES"
+  ) +
+  scale_size_continuous(
+    range = c(1, 5),
+    name = "-log10(FDR)"
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    strip.background = element_rect(fill = "white", colour = "black"),
+    strip.text = element_text(face = "bold"),
+    axis.text.y = element_text(size = 7)
+  ) +
+  labs(
+    x = "NES",
+    y = NULL,
+    title = "Top Hallmark pathways per cell type and contrast"
+  )
+
+p_top_gsea
+```
+
+```{r}
+ggsave(
+  file.path(output_dir, "GSEA_top10_pathways_per_celltype_contrast.png"),
+  plot = p_top_gsea,
+  width = 8,
+  height = 8,
+  dpi = 300
+)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+story_pathways <- c(
+  "HALLMARK_HYPOXIA",
+  "HALLMARK_ANGIOGENESIS",
+  "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+  "HALLMARK_TGF_BETA_SIGNALING",
+  "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+  "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+  "HALLMARK_INFLAMMATORY_RESPONSE",
+  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+  "HALLMARK_GLYCOLYSIS",
+  "HALLMARK_FATTY_ACID_METABOLISM",
+  "HALLMARK_OXIDATIVE_PHOSPHORYLATION"
+)
+
+gsea_story_clean <- gsea_hallmark_df %>%
+  filter(pathway %in% story_pathways) %>%
+  mutate(
+    pathway_clean = pathway %>%
+      str_replace("^HALLMARK_", "") %>%
+      str_replace_all("_", " ") %>%
+      str_to_title(),
+    
+    pathway_clean = factor(
+      pathway_clean,
+      levels = rev(c(
+        "Hypoxia",
+        "Angiogenesis",
+        "Epithelial Mesenchymal Transition",
+        "Tgf Beta Signaling",
+        "Interferon Gamma Response",
+        "Interferon Alpha Response",
+        "Inflammatory Response",
+        "Tnfa Signaling Via Nfkb",
+        "Glycolysis",
+        "Fatty Acid Metabolism",
+        "Oxidative Phosphorylation"
+      ))
+    ),
+    
+    contrast_clean = case_when(
+      contrast == "PRE_Resistant_vs_PRE_Responsive" ~ "PRE R vs PRE Resp",
+      contrast == "PROG_Resistant_vs_PRE_Responsive" ~ "PROG R vs PRE Resp",
+      contrast == "PROG_Resistant_vs_PRE_Resistant" ~ "PROG R vs PRE R",
+      TRUE ~ contrast
+    ),
+    
+    contrast_clean = factor(
+      contrast_clean,
+      levels = c(
+        "PRE R vs PRE Resp",
+        "PROG R vs PRE Resp",
+        "PROG R vs PRE R"
+      )
+    ),
+    
+    sig_label = case_when(
+      padj < 0.001 ~ "***",
+      padj < 0.01  ~ "**",
+      padj < 0.05  ~ "*",
+      padj < 0.10  ~ ".",
+      TRUE ~ ""
+    )
+  )
+
+p_gsea_story_heatmap <- ggplot(
+  gsea_story_clean,
+  aes(
+    x = contrast_clean,
+    y = pathway_clean,
+    fill = NES
+  )
+) +
+  geom_tile(colour = "white", linewidth = 0.35) +
+  geom_text(aes(label = sig_label), size = 3.8) +
+  facet_wrap(~ celltype, nrow = 1) +
+  scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "white",
+    high = "#D7191C",
+    midpoint = 0,
+    name = "NES"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 9),
+    strip.background = element_rect(fill = "white", colour = "black"),
+    strip.text = element_text(face = "bold"),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.4)
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Pseudobulk GSEA of selected Hallmark pathways"
+  )
+
+p_gsea_story_heatmap
+```
+
+```{r}
+ggsave(
+  file.path(output_dir, "GSEA_story_pathways_clean_heatmap.png"),
+  plot = p_gsea_story_heatmap,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r}
+plot_top_gsea_for_celltype <- function(
+    gsea_df,
+    celltype_use,
+    top_n = 8,
+    out_dir = output_dir
+) {
+  
+  df <- gsea_df %>%
+    filter(celltype == celltype_use) %>%
+    group_by(contrast) %>%
+    arrange(padj, .by_group = TRUE) %>%
+    slice_head(n = top_n) %>%
+    ungroup() %>%
+    mutate(
+      pathway_clean = pathway %>%
+        str_replace("^HALLMARK_", "") %>%
+        str_replace_all("_", " ") %>%
+        str_to_title(),
+      
+      contrast_clean = case_when(
+        contrast == "PRE_Resistant_vs_PRE_Responsive" ~ "PRE R vs PRE Resp",
+        contrast == "PROG_Resistant_vs_PRE_Responsive" ~ "PROG R vs PRE Resp",
+        contrast == "PROG_Resistant_vs_PRE_Resistant" ~ "PROG R vs PRE R",
+        TRUE ~ contrast
+      ),
+      
+      contrast_clean = factor(
+        contrast_clean,
+        levels = c(
+          "PRE R vs PRE Resp",
+          "PROG R vs PRE Resp",
+          "PROG R vs PRE R"
+        )
+      ),
+      
+      neglog10_padj = -log10(padj),
+      pathway_clean = reorder(pathway_clean, NES)
+    )
+  
+  p <- ggplot(
+    df,
+    aes(
+      x = NES,
+      y = pathway_clean,
+      colour = NES,
+      size = neglog10_padj
+    )
+  ) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.3) +
+    geom_point(alpha = 0.9) +
+    facet_wrap(~ contrast_clean, nrow = 1, scales = "free_y") +
+    scale_colour_gradient2(
+      low = "#2C7BB6",
+      mid = "grey90",
+      high = "#D7191C",
+      midpoint = 0,
+      name = "NES"
+    ) +
+    scale_size_continuous(
+      range = c(1.5, 5),
+      name = "-log10(FDR)"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(
+      axis.text.y = element_text(size = 8),
+      axis.text.x = element_text(size = 9),
+      strip.background = element_rect(fill = "white", colour = "black"),
+      strip.text = element_text(face = "bold"),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.35)
+    ) +
+    labs(
+      x = "NES",
+      y = NULL,
+      title = paste0("Top Hallmark pathways: ", celltype_use)
+    )
+  
+  print(p)
+  
+  ggsave(
+    filename = file.path(out_dir, paste0("GSEA_top_pathways_", celltype_use, ".png")),
+    plot = p,
+    width = 11,
+    height = 4.5,
+    dpi = 300
+  )
+  
+  return(p)
+}
+```
+
+```{r}
+p_top_melanocyte <- plot_top_gsea_for_celltype(
+  gsea_hallmark_df,
+  "Melanocyte",
+  top_n = 10,
+  out_dir = output_dir
+)
+
+p_top_cd8 <- plot_top_gsea_for_celltype(
+  gsea_hallmark_df,
+  "CD8_T",
+  top_n = 10,
+  out_dir = output_dir
+)
+
+p_top_endo <- plot_top_gsea_for_celltype(
+  gsea_hallmark_df,
+  "Endothelial",
+  top_n = 10,
+  out_dir = output_dir
+)
+
+p_top_mac <- plot_top_gsea_for_celltype(
+  gsea_hallmark_df,
+  "Macrophage",
+  top_n = 10,
+  out_dir = output_dir
+)
+```
+
+```{r}
+top_gsea_directional <- gsea_hallmark_df %>%
+  filter(padj < 0.10) %>%
+  group_by(celltype, contrast) %>%
+  arrange(desc(NES), .by_group = TRUE) %>%
+  slice_head(n = 5) %>%
+  bind_rows(
+    gsea_hallmark_df %>%
+      filter(padj < 0.10) %>%
+      group_by(celltype, contrast) %>%
+      arrange(NES, .by_group = TRUE) %>%
+      slice_head(n = 5)
+  ) %>%
+  ungroup() %>%
+  distinct(celltype, contrast, pathway, .keep_all = TRUE) %>%
+  mutate(
+    pathway_clean = pathway %>%
+      str_replace("^HALLMARK_", "") %>%
+      str_replace_all("_", " ") %>%
+      str_to_title(),
+    
+    contrast_clean = case_when(
+      contrast == "PRE_Resistant_vs_PRE_Responsive" ~ "PRE R vs PRE Resp",
+      contrast == "PROG_Resistant_vs_PRE_Responsive" ~ "PROG R vs PRE Resp",
+      contrast == "PROG_Resistant_vs_PRE_Resistant" ~ "PROG R vs PRE R",
+      TRUE ~ contrast
+    ),
+    
+    neglog10_padj = -log10(padj)
+  )
+```
+
+```{r}
+plot_directional_gsea <- function(df, celltype_use) {
+  
+  df_use <- df %>%
+    filter(celltype == celltype_use) %>%
+    mutate(pathway_clean = reorder(pathway_clean, NES))
+  
+  p <- ggplot(
+    df_use,
+    aes(
+      x = NES,
+      y = pathway_clean,
+      colour = NES,
+      size = neglog10_padj
+    )
+  ) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.3) +
+    geom_point(alpha = 0.9) +
+    facet_wrap(~ contrast_clean, nrow = 1, scales = "free_y") +
+    scale_colour_gradient2(
+      low = "#2C7BB6",
+      mid = "grey90",
+      high = "#D7191C",
+      midpoint = 0,
+      name = "NES"
+    ) +
+    scale_size_continuous(
+      range = c(1.5, 5),
+      name = "-log10(FDR)"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(
+      axis.text.y = element_text(size = 8),
+      strip.background = element_rect(fill = "white", colour = "black"),
+      strip.text = element_text(face = "bold"),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.35)
+    ) +
+    labs(
+      x = "NES",
+      y = NULL,
+      title = paste0("Directionally enriched Hallmark pathways: ", celltype_use)
+    )
+  
+  return(p)
+}
+
+p_dir_melanocyte <- plot_directional_gsea(top_gsea_directional, "Melanocyte")
+p_dir_cd8        <- plot_directional_gsea(top_gsea_directional, "CD8_T")
+```
+
+```{r}
+ggsave(
+  file.path(output_dir, "GSEA_directional_top_Melanocyte.png"),
+  plot = p_dir_melanocyte,
+  width = 11,
+  height = 4.5,
+  dpi = 300
+)
+
+ggsave(
+  file.path(output_dir, "GSEA_directional_top_CD8T.png"),
+  plot = p_dir_cd8,
+  width = 11,
+  height = 4.5,
+  dpi = 300
+)
+```
+
+```{r}
+p_dir_endo <- plot_directional_gsea(
+  top_gsea_directional,
+  "Endothelial"
+)
+
+p_dir_mac <- plot_directional_gsea(
+  top_gsea_directional,
+  "Macrophage"
+)
+```
+
+```{r}
+ggsave(
+  file.path(output_dir, "GSEA_directional_top_Endothelial.png"),
+  plot = p_dir_endo,
+  width = 11,
+  height = 4.5,
+  dpi = 300
+)
+
+ggsave(
+  file.path(output_dir, "GSEA_directional_top_Macrophage.png"),
+  plot = p_dir_mac,
+  width = 11,
+  height = 4.5,
+  dpi = 300
+)
+```
+
